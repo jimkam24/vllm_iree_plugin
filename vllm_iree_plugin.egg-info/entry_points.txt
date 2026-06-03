@@ -1,0 +1,2 @@
+[vllm.platform_plugins]
+iree = vllm_plugin.platform:get_platform_cls_qualname
