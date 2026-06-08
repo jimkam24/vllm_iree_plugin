@@ -4,10 +4,11 @@ vllm_iree_plugin.egg-info/SOURCES.txt
 vllm_iree_plugin.egg-info/dependency_links.txt
 vllm_iree_plugin.egg-info/entry_points.txt
 vllm_iree_plugin.egg-info/top_level.txt
-vllm_plugin/__init__.py
 vllm_plugin/platform.py
 vllm_plugin/attention/__init__.py
 vllm_plugin/attention/attention.py
+vllm_plugin/executor/__init__.py
+vllm_plugin/executor/hybrid_executor.py
 vllm_plugin/worker/__init__.py
 vllm_plugin/worker/model_runner.py
 vllm_plugin/worker/worker.py

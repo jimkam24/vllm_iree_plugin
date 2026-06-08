@@ -15,6 +15,9 @@ class IREEPlatform(Platform):
     device_name: str = "cuda"
     device_type: str = "cuda"
     simple_compile_backend: str = "eager"   # disable torch.compile
+    ray_device_key: str = "GPU"                        # add this
+    device_control_env_var: str = "CUDA_VISIBLE_DEVICES"  # add this
+    dist_backend: str = "nccl"    # add this line
 
 
     # identifier for the custom backend
@@ -46,45 +49,105 @@ class IREEPlatform(Platform):
     @classmethod
     def check_and_update_config(cls, vllm_config) -> None:
         from vllm.config import CompilationMode
-        """
-        Called once after the full VllmConfig is built.
-        Use this to:
-          - point vLLM at our worker class
-          - disable CUDA-specific compilation paths
-          - set block size and other backend constraints
-        """
+        import os
 
-        # 1. Route all workers to IREEWorker.
+        my_rank = int(os.environ.get("MY_PP_RANK", "0"))
+        iree_rank = int(os.environ.get("IREE_WORKER_RANK", "0"))
+        is_hybrid = "MY_PP_RANK" in os.environ
+        print(f"[IREEPlatform.check_and_update_config] MY_PP_RANK={my_rank} IREE_WORKER_RANK={iree_rank} is_hybrid={is_hybrid}", flush=True)
+
+        if is_hybrid and my_rank != iree_rank:
+            # This is the native CUDA rank — use gpu_worker, don't touch compilation
+            if vllm_config.parallel_config.worker_cls == "auto":
+                vllm_config.parallel_config.worker_cls = (
+                    "vllm.v1.worker.gpu_worker.Worker"
+                )
+            return
+
+        # This is the IREE rank (or single-worker mode) — use IREEWorker
         if vllm_config.parallel_config.worker_cls == "auto":
-            vllm_config.parallel_config.worker_cls = "vllm_plugin.worker.IREEWorker"
-
-        # 2. Disable CUDA-specific compilation
-        from vllm.config import CompilationMode
+            vllm_config.parallel_config.worker_cls = (
+                "vllm_plugin.worker.worker.IREEWorker"
+            )
         vllm_config.compilation_config.mode = CompilationMode.NONE
-
-        # 3. Block size — 16 is a safe default; TODO: revisit when profiling KV cache.
         if vllm_config.cache_config is not None:
             vllm_config.cache_config.block_size = 16
-
-    # returns the attention backend string path
+        
     @classmethod
-    def get_attn_backend_cls(cls, 
-                             selected_backend,  # AttentionBackendEnum
-                             attn_selector_config, # AttentionSelectorConfig
-                             ) -> str:
-        """
-        Return the dotted import path of our attention backend.
-        vLLM will import this class and use it for all attention layers.
- 
-        attn_selector_config fields available if needed later:
-            .head_size, .dtype, .kv_cache_dtype, .block_size,
-            .use_mla, .has_sink, .use_sparse, .use_mm_prefix, .attn_type
-        """
+    def get_attn_backend_cls(cls, selected_backend, attn_selector_config) -> str:
+        # Backend is set directly via attention_config.backend in HybridExecutor
+        # for multi-rank setups. This fallback handles single-worker mode.
+        return "vllm_plugin.attention.attention.IREEAttentionBackend"
 
-        return "vllm_plugin.attention.IREEAttentionBackend"
+    # @classmethod
+    # def get_attn_backend_cls(cls, selected_backend, attn_selector_config) -> str:
+    #     import os
+    #     import torch
+    #     # my_rank = int(os.environ.get("MY_PP_RANK", "0"))
+    #     # iree_rank = int(os.environ.get("IREE_WORKER_RANK", "0"))
+    #     # is_hybrid = "MY_PP_RANK" in os.environ
+
+    #     # if is_hybrid and my_rank != iree_rank:
+    #     #     # Native CUDA rank — pick best backend based on compute capability.
+    #     #     # FA2 requires sm_80+, Triton works on sm_70+.
+    #     #     major, _ = torch.cuda.get_device_capability(0)
+        
+    #     my_rank = int(os.environ.get("MY_PP_RANK", "-1"))
+    #     iree_rank = int(os.environ.get("IREE_WORKER_RANK", "-1"))
+    #     is_hybrid = "MY_PP_RANK" in os.environ
+    #     import torch
+    #     major, _ = torch.cuda.get_device_capability(0)
+    #     print(f"[get_attn_backend_cls] MY_PP_RANK={my_rank} IREE_WORKER_RANK={iree_rank} is_hybrid={is_hybrid} sm={major}0", flush=True)
+        
+    #         # if major >= 8:
+    #         #     return "vllm.v1.attention.backends.flash_attn.FlashAttentionBackend"
+    #         # else:
+    #         #     return "vllm.v1.attention.backends.triton_attn.TritonAttentionBackend"
+
+    #     # IREE rank or single-worker mode
+    #     return "vllm_plugin.attention.attention.IREEAttentionBackend"
+    
+    @classmethod
+    def set_device(cls, device: torch.device) -> None:
+        # For the native CUDA worker (rank 0) running under IREEPlatform,
+        # delegate to torch.cuda directly.
+        if device.type == "cuda":
+            torch.cuda.set_device(device)
+            
+    @classmethod
+    def is_cuda_alike(cls) -> bool:
+        # We run on CUDA hardware in Phase 1, so CUDA-alike ops are valid.
+        return True
+    
+    @classmethod
+    def check_if_supports_dtype(cls, dtype: torch.dtype) -> None:
+        # Allow all dtypes — the native CUDA worker validates its own dtype
+        # separately. We don't restrict at the platform level.
+        pass
+
+    @classmethod
+    def get_device_capability(cls, device_id: int = 0):
+        from vllm.platforms.interface import DeviceCapability
+        if torch.cuda.is_available():
+            major, minor = torch.cuda.get_device_capability(device_id)
+            return DeviceCapability(major=major, minor=minor)
+        return None
+
+    @classmethod
+    def get_current_memory_usage(cls, device=None) -> float:
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats(device)
+            return torch.cuda.max_memory_allocated(device)
+        return 0.0
     
 def get_platform_cls_qualname() -> str:
-    return "vllm_plugin.platform.IREEPlatform"
+    import os
+    pp_rank = os.environ.get("IREE_PP_RANK", "")
+    # In hybrid mode, only activate IREEPlatform on the IREE rank.
+    # If IREE_PP_RANK is not set, activate unconditionally (single-worker mode).
+    if pp_rank == "" or pp_rank == "1":
+        return "vllm_plugin.platform.IREEPlatform"
+    return None  # rank 0 falls through to default CUDA platform
 
 # Future hooks (not needed for now)
 

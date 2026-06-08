@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=42"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vllm-iree-plugin"
+version = "0.1.0"
+description = "IREE backend plugin for vLLM"
+requires-python = ">=3.11"
+
+[project.entry-points."vllm.platform_plugins"]
+iree = "vllm_plugin.platform:get_platform_cls_qualname"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["vllm_plugin*"]

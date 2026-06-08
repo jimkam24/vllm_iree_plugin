@@ -68,11 +68,10 @@ class IREEAttentionBackend(AttentionBackend):
         num_kv_heads: int,
         head_size: int,
         cache_type: str = "",
+        cache_dtype_str: str = "",   # add this
     ) -> tuple[int, ...]:
-        # [2, blocks, block_size, heads, head_dim]
-        # Dim 0 = 2: index 0 is K cache, index 1 is V cache.
         return (2, num_blocks, block_size, num_kv_heads, head_size)
- 
+    
     @staticmethod
     def swap_blocks(
         src_kv_cache: list[torch.Tensor],
@@ -209,12 +208,17 @@ class IREEAttentionBackendImpl(AttentionImpl):
     ) -> None:
         """
         Scatter new K/V tokens into the paged KV cache.
-        slot_mapping[i] is the flat cache slot for token i.
+        key/value arrive as [num_tokens, num_heads * head_size] — flat.
+        Cache expects [num_slots, num_kv_heads, head_size] — split into heads.
         """
+        # Reshape from flat [T, H*D] to headed [T, num_kv_heads, head_size]
+        key_headed = key.view(-1, self.num_kv_heads, self.head_size)
+        val_headed = value.view(-1, self.num_kv_heads, self.head_size)
+
         flat_k = self.key_cache.view(-1, self.num_kv_heads, self.head_size)
         flat_v = self.value_cache.view(-1, self.num_kv_heads, self.head_size)
-        flat_k[slot_mapping] = key
-        flat_v[slot_mapping] = value
+        flat_k[slot_mapping] = key_headed
+        flat_v[slot_mapping] = val_headed
  
     def forward(
         self,

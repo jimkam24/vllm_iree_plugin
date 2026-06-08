@@ -7,6 +7,7 @@ vLLM calls this class at every step of the engine loop:
 """
  
 import torch
+import os
 import torch.nn as nn
 from vllm.config import VllmConfig
 from vllm.utils.torch_utils import set_random_seed
@@ -52,7 +53,11 @@ class IREEWorker(WorkerBase):
         )
         # model_runner is created here so other methods can reference it,
         # but load_model() is where weights are actually loaded.
-        self.model_runner = IREEModelRunner(self.vllm_config)
+        self.model_runner = IREEModelRunner(
+            self.vllm_config,
+            force_recompile=bool(os.environ.get("IREE_FORCE_RECOMPILE", "")),
+            vmfb_dir=os.environ.get("IREE_VMFB_DIR", "/tmp/iree_artifacts"),
+        )
 
     def init_device(self) -> None:
         import os
@@ -64,7 +69,7 @@ class IREEWorker(WorkerBase):
             rank=self.rank,
             distributed_init_method=self.distributed_init_method,
             local_rank=self.local_rank,
-            backend="gloo",
+            backend="nccl",
         )
 
         ensure_model_parallel_initialized(
@@ -73,6 +78,8 @@ class IREEWorker(WorkerBase):
         )
 
         set_random_seed(self.model_config.seed)
+        # With CUDA_VISIBLE_DEVICES=<rank>, the worker sees only 1 GPU
+        # which always appears as cuda:0 within its own process.
         self.device = torch.device("cuda:0")
         logger.info("IREEWorker: device initialised (%s)", self.device)
     
@@ -84,16 +91,15 @@ class IREEWorker(WorkerBase):
     def determine_available_memory(self) -> int:
         """
         Return available memory in bytes for KV cache allocation.
-        IREE manages GPU memory internally, so we return a synthetic
-        value that keeps vLLM's scheduler happy.
-        The factor of 2 gives the scheduler headroom for its null-block.
+        IREE manages GPU memory internally so we can't profile it the
+        same way the native worker does. Instead we return the actual
+        free GPU memory on our device, which gives get_kv_cache_configs
+        a realistic value to work with.
         """
-        return (
-            4                                   # bytes per token (fp32)
-            * self.model_config.max_model_len
-            * self.scheduler_config.max_num_seqs
-            * 2                                 # headroom factor
-        )
+        free, total = torch.cuda.mem_get_info(0)  # cuda:0 within this process
+        # Apply gpu_memory_utilization fraction, then subtract model weights
+        usable = int(free * self.cache_config.gpu_memory_utilization)
+        return max(usable, 0)
  
 
     def initialize_cache(
@@ -130,24 +136,57 @@ class IREEWorker(WorkerBase):
         self,
         scheduler_output: SchedulerOutput,
     ) -> ModelRunnerOutput | None:
-        """
-        Called at every engine step.
-        Non-driver workers return None — only the driver collects output.
-        """
         if not scheduler_output.total_num_scheduled_tokens:
             return EMPTY_MODEL_RUNNER_OUTPUT
- 
-        output = self.model_runner.execute_model(scheduler_output)
+
+        from vllm.distributed.parallel_state import get_pp_group
+        from vllm.v1.outputs import SamplerOutput
+        pp_group = get_pp_group()
+        intermediate_tensors = None
+
+        # ── Receive from previous rank (if not first) ─────────────────────
+        if not pp_group.is_first_rank:
+            from vllm.distributed.parallel_state import get_tp_group
+            tensor_dict = pp_group.recv_tensor_dict(
+                all_gather_group=get_tp_group(),
+                all_gather_tensors={},
+            )
+            intermediate_tensors = tensor_dict  # pass to model runner later
+
+        # ── Run forward pass ──────────────────────────────────────────────
+        output = self.model_runner.execute_model(
+            scheduler_output,
+            intermediate_tensors=intermediate_tensors,
+        )
+
+        # ── Send to next rank (if not last) ───────────────────────────────
+        # output is IntermediateTensors when we are not the last rank
+        if not pp_group.is_last_rank:
+            assert isinstance(output, dict), (
+                "Expected IntermediateTensors dict from model runner "
+                "when not last PP rank"
+            )
+            pp_group.send_tensor_dict(output, all_gather_group=None)
+            return None  # intermediate ranks don't return final output
+
+        # ── Last rank returns final output ────────────────────────────────
         return output if self.is_driver_worker else None
- 
+    
     def sample_tokens(self, grammar_output: object) -> object:
         # Required by WorkerBase interface; sampling happens inside
         # execute_model for now.
         return EMPTY_MODEL_RUNNER_OUTPUT
     
+    #TODO: ping IREE worker to see if it still is ok
     def check_health(self) -> None:
-        # TODO: ping iree.runtime to verify the device is still alive.
-        return
+        from vllm.distributed.parallel_state import get_pp_group
+        pp = get_pp_group()
+        logger.info(
+            "check_health: rank=%d pp.ranks=%s pp.world_size=%d "
+            "is_first=%s is_last=%s",
+            self.rank, pp.ranks, pp.world_size,
+            pp.is_first_rank, pp.is_last_rank,
+        )
 
 
     
