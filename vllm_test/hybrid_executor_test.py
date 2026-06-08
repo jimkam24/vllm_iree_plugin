@@ -9,6 +9,7 @@ Run from /vllm_iree/vllm_test/:
 """
 
 import os
+os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
 os.environ["VLLM_PLUGINS"] = "iree"
 os.environ["MASTER_ADDR"] = "127.0.0.1"
 os.environ["MASTER_PORT"] = "29500"
