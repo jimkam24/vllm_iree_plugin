@@ -159,28 +159,49 @@ class IREEWorker(WorkerBase):
             intermediate_tensors=intermediate_tensors,
         )
 
+        # Store for sample_tokens() call
+        if pp_group.is_last_rank:
+            self._last_output = output
+
         # ── Send to next rank (if not last) ───────────────────────────────
         # output is IntermediateTensors when we are not the last rank
         if not pp_group.is_last_rank:
-            assert isinstance(output, dict), (
-                "Expected IntermediateTensors dict from model runner "
-                "when not last PP rank"
+            from vllm.distributed.parallel_state import get_tp_group
+            # TODO (Step 3b): send real intermediate tensors from IREE partial forward.
+            # For now send a zero tensor of the correct hidden state shape so the
+            # native worker can proceed (output will be garbage but wiring is tested).
+            hidden_size = self.model_config.hf_config.hidden_size
+            num_tokens = scheduler_output.total_num_scheduled_tokens
+            stub_hidden = torch.zeros(
+                num_tokens, hidden_size,
+                dtype=torch.float32,
+                device=self.device,
             )
-            pp_group.send_tensor_dict(output, all_gather_group=None)
-            return None  # intermediate ranks don't return final output
+            pp_group.send_tensor_dict(
+                {"hidden_states": stub_hidden},
+                all_gather_group=get_tp_group(),
+            )
+            return None
 
         # ── Last rank returns final output ────────────────────────────────
         return output if self.is_driver_worker else None
     
     def sample_tokens(self, grammar_output: object) -> object:
-        # Required by WorkerBase interface; sampling happens inside
-        # execute_model for now.
+        # For IREE as last rank: output was already computed in execute_model.
+        # For IREE as first rank: no sampling needed, return empty.
+        from vllm.distributed.parallel_state import get_pp_group
+        if get_pp_group().is_last_rank:
+            # Return the stored output from the last execute_model call
+            output = getattr(self, '_last_output', EMPTY_MODEL_RUNNER_OUTPUT)
+            self._last_output = None
+            return output
         return EMPTY_MODEL_RUNNER_OUTPUT
     
     #TODO: ping IREE worker to see if it still is ok
     def check_health(self) -> None:
         from vllm.distributed.parallel_state import get_pp_group
         pp = get_pp_group()
+        print(f"[check_health rank={self.rank}] pp.rank_in_group={pp.rank_in_group} pp.world_size={pp.world_size} is_last={pp.is_last_rank}", flush=True)
         logger.info(
             "check_health: rank=%d pp.ranks=%s pp.world_size=%d "
             "is_first=%s is_last=%s",

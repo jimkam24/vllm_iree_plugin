@@ -70,64 +70,77 @@ class HybridExecutor(RayDistributedExecutor):
 
         def patched_collective_rpc(method, timeout=None, args=(), kwargs=None,
                                     non_block=False, **kw):
-            # Intercept only the init_worker call
+            # Parse IREE worker ranks once at the top — supports multiple IREE ranks
+            iree_worker_ranks = set(
+                int(x.strip())
+                for x in os.environ.get("IREE_WORKER_RANKS", "1").split(",")
+            )
+
+            if method == "update_environment_variables" and args:
+                all_env_vars = list(args[0])
+                gpu_assignment = os.environ.get("IREE_GPU_ASSIGNMENT", "")
+                gpu_indices = [x.strip() for x in gpu_assignment.split(",")] if gpu_assignment else None
+
+                for rank, env_dict in enumerate(all_env_vars):
+                    if gpu_indices and rank < len(gpu_indices):
+                        env_dict["CUDA_VISIBLE_DEVICES"] = gpu_indices[rank]
+                    else:
+                        env_dict["CUDA_VISIBLE_DEVICES"] = str(rank)
+                    env_dict["MY_PP_RANK"] = str(rank)
+                    # Send the full set string so workers can reconstruct it
+                    env_dict["IREE_WORKER_RANKS"] = os.environ.get("IREE_WORKER_RANKS", "1")
+                args = (all_env_vars,)
+                logger.info(
+                    "HybridExecutor: injected per-rank CUDA_VISIBLE_DEVICES into "
+                    "update_environment_variables"
+                )
+
             if method == "init_worker" and args:
                 all_kwargs = list(args[0])
-                
+                from vllm.v1.attention.backends.registry import AttentionBackendEnum
+                import copy
+
                 for rank, wk in enumerate(all_kwargs):
                     logger.info(
                         "init_worker rank %d worker_cls=%s",
                         rank,
                         wk["vllm_config"].parallel_config.worker_cls,
                     )
-                        
-                logger.info(
-                    "HybridExecutor: injecting per-rank worker classes..."
-                )
-                for rank, worker_kwargs in enumerate(all_kwargs):
-                    if rank == 0:
-                        worker_cls = _RANK0_WORKER_CLS
-                    else:
-                        worker_cls = _RANK1_WORKER_CLS
 
-                    # Clone config and set worker_cls for this rank
-                    import copy
+                logger.info("HybridExecutor: injecting per-rank worker classes...")
+
+                for rank, worker_kwargs in enumerate(all_kwargs):
+                    if rank in iree_worker_ranks:
+                        worker_cls = _RANK1_WORKER_CLS  # IREEWorker
+                    else:
+                        worker_cls = _RANK0_WORKER_CLS  # native gpu_worker
+
                     cfg = copy.deepcopy(worker_kwargs["vllm_config"])
                     cfg.parallel_config.worker_cls = worker_cls
-
-                    # Tell gpu_worker it's running under Ray so it skips the
-                    # local_world_size <= visible_device_count assertion.
-                    # The assertion only fires when backend is not "ray".
                     cfg.parallel_config.distributed_executor_backend = "ray"
 
-                    # Embed PP rank for layer partition in IREEModelRunner
+                    if rank in iree_worker_ranks:
+                        cfg.attention_config.backend = AttentionBackendEnum.CUSTOM
+                    else:
+                        cfg.attention_config.backend = AttentionBackendEnum.TRITON_ATTN
+
                     if cfg.additional_config is None:
                         cfg.additional_config = {}
                     cfg.additional_config["hybrid_pp_rank"] = rank
                     cfg.additional_config["hybrid_pp_world_size"] = len(all_kwargs)
 
-                    all_kwargs[rank] = {**worker_kwargs, "vllm_config": cfg}
+                    all_kwargs[rank] = {
+                        **worker_kwargs,
+                        "vllm_config": cfg,
+                        "local_rank": 0,
+                        "is_driver_worker": (rank == len(all_kwargs) - 1),
+                    }
                     logger.info(
                         "  rank %d -> %s (layers: hybrid_pp_rank=%d/%d)",
                         rank, worker_cls, rank, len(all_kwargs),
                     )
 
                 args = (all_kwargs,)
-                
-                
-            if method == "update_environment_variables" and args:
-                # Inject per-rank CUDA_VISIBLE_DEVICES before Ray sets env vars
-                all_env_vars = list(args[0])
-                iree_worker_rank = int(os.environ.get("IREE_WORKER_RANK", "1"))
-                for rank, env_dict in enumerate(all_env_vars):
-                    env_dict["CUDA_VISIBLE_DEVICES"] = str(rank)
-                    env_dict["MY_PP_RANK"] = str(rank)
-                    env_dict["IREE_WORKER_RANK"] = str(iree_worker_rank)
-                args = (all_env_vars,)
-                logger.info(
-                    "HybridExecutor: injected per-rank CUDA_VISIBLE_DEVICES "
-                    "into update_environment_variables"
-                )
 
             return original_collective_rpc(
                 method, timeout=timeout, args=args,
@@ -142,25 +155,6 @@ class HybridExecutor(RayDistributedExecutor):
             # Always restore original collective_rpc
             self.collective_rpc = original_collective_rpc
             
-        if hasattr(self, '_env_vars_for_all_workers'):
-            iree_worker_rank = int(os.environ.get("IREE_WORKER_RANK", "1"))
-            
-            # Override CUDA_VISIBLE_DEVICES per rank so each worker sees only its GPU.
-            # Without this, all workers on the same node see all GPUs and NCCL
-            # reports duplicate GPU error.
-            for rank, env_dict in enumerate(self._env_vars_for_all_workers):
-                env_dict["CUDA_VISIBLE_DEVICES"] = str(rank)  # rank 0 → GPU 0, rank 1 → GPU 1
-                env_dict["MY_PP_RANK"] = str(rank)
-                env_dict["IREE_WORKER_RANK"] = str(iree_worker_rank)
-            
-            self.collective_rpc(
-                "update_environment_variables",
-                args=(self._get_env_vars_to_be_updated(),),
-            )
-            logger.info(
-                "HybridExecutor: per-rank GPU isolation set — "
-                "rank 0 → CUDA_VISIBLE_DEVICES=0, rank 1 → CUDA_VISIBLE_DEVICES=1"
-            )
 
         logger.info("HybridExecutor: both workers initialised via Ray.")
 
@@ -191,19 +185,29 @@ class HybridExecutor(RayDistributedExecutor):
         import time
         t_start = time.perf_counter()
 
+        # Phase 1: forward pass on all workers
         outputs = self.collective_rpc(
             "execute_model",
             args=(scheduler_output,),
         )
 
+        # Phase 2: sample tokens on all workers
+        # gpu_model_runner uses async two-phase execution:
+        # execute_model() stores state and returns None,
+        # sample_tokens() reads state and returns ModelRunnerOutput.
+        # We must call sample_tokens() on all workers after execute_model().
+        sample_outputs = self.collective_rpc(
+            "sample_tokens",
+            args=(None,),  # grammar_output=None (no structured output)
+        )
+
         t_elapsed_ms = (time.perf_counter() - t_start) * 1000
         logger.debug("HybridExecutor.execute_model: %.2f ms", t_elapsed_ms)
 
-        # Rank 0 (first PP rank) returns None — it sends activations to rank 1.
-        # Rank 1 (last PP rank) returns the final ModelRunnerOutput.
-        # outputs list is ordered by rank, so outputs[1] is IREEWorker's output.
-        for output in reversed(outputs):
-            if output is not None:
+        # Return the first non-empty output from sample_tokens.
+        # The last PP rank produces the final ModelRunnerOutput.
+        for output in sample_outputs:
+            if output is not None and output.req_ids:
                 return output
         return None
 

@@ -52,11 +52,14 @@ class IREEPlatform(Platform):
         import os
 
         my_rank = int(os.environ.get("MY_PP_RANK", "0"))
-        iree_rank = int(os.environ.get("IREE_WORKER_RANK", "0"))
-        is_hybrid = "MY_PP_RANK" in os.environ
-        print(f"[IREEPlatform.check_and_update_config] MY_PP_RANK={my_rank} IREE_WORKER_RANK={iree_rank} is_hybrid={is_hybrid}", flush=True)
+        iree_ranks = set(
+            int(x.strip())
+            for x in os.environ.get("IREE_WORKER_RANKS", "1").split(",")
+        )
 
-        if is_hybrid and my_rank != iree_rank:
+        is_hybrid = "MY_PP_RANK" in os.environ
+
+        if is_hybrid and my_rank != iree_ranks:
             # This is the native CUDA rank — use gpu_worker, don't touch compilation
             if vllm_config.parallel_config.worker_cls == "auto":
                 vllm_config.parallel_config.worker_cls = (
@@ -78,41 +81,21 @@ class IREEPlatform(Platform):
         # Backend is set directly via attention_config.backend in HybridExecutor
         # for multi-rank setups. This fallback handles single-worker mode.
         return "vllm_plugin.attention.attention.IREEAttentionBackend"
-
-    # @classmethod
-    # def get_attn_backend_cls(cls, selected_backend, attn_selector_config) -> str:
-    #     import os
-    #     import torch
-    #     # my_rank = int(os.environ.get("MY_PP_RANK", "0"))
-    #     # iree_rank = int(os.environ.get("IREE_WORKER_RANK", "0"))
-    #     # is_hybrid = "MY_PP_RANK" in os.environ
-
-    #     # if is_hybrid and my_rank != iree_rank:
-    #     #     # Native CUDA rank — pick best backend based on compute capability.
-    #     #     # FA2 requires sm_80+, Triton works on sm_70+.
-    #     #     major, _ = torch.cuda.get_device_capability(0)
-        
-    #     my_rank = int(os.environ.get("MY_PP_RANK", "-1"))
-    #     iree_rank = int(os.environ.get("IREE_WORKER_RANK", "-1"))
-    #     is_hybrid = "MY_PP_RANK" in os.environ
-    #     import torch
-    #     major, _ = torch.cuda.get_device_capability(0)
-    #     print(f"[get_attn_backend_cls] MY_PP_RANK={my_rank} IREE_WORKER_RANK={iree_rank} is_hybrid={is_hybrid} sm={major}0", flush=True)
-        
-    #         # if major >= 8:
-    #         #     return "vllm.v1.attention.backends.flash_attn.FlashAttentionBackend"
-    #         # else:
-    #         #     return "vllm.v1.attention.backends.triton_attn.TritonAttentionBackend"
-
-    #     # IREE rank or single-worker mode
-    #     return "vllm_plugin.attention.attention.IREEAttentionBackend"
     
     @classmethod
     def set_device(cls, device: torch.device) -> None:
-        # For the native CUDA worker (rank 0) running under IREEPlatform,
-        # delegate to torch.cuda directly.
-        if device.type == "cuda":
-            torch.cuda.set_device(device)
+        import os
+        my_rank = int(os.environ.get("MY_PP_RANK", "0"))
+        iree_rank = int(os.environ.get("IREE_WORKER_RANKS", "1"))
+        is_hybrid = "MY_PP_RANK" in os.environ
+
+        if is_hybrid and my_rank != iree_rank:
+            # Native CUDA worker — CUDA_VISIBLE_DEVICES already restricts
+            # to one GPU, which always appears as cuda:0 within this process.
+            torch.cuda.set_device(0)
+        else:
+            # IREE worker — IREE manages its own device context.
+            pass
             
     @classmethod
     def is_cuda_alike(cls) -> bool:
