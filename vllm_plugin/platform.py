@@ -59,11 +59,11 @@ class IREEPlatform(Platform):
 
         is_hybrid = "MY_PP_RANK" in os.environ
 
-        if is_hybrid and my_rank != iree_ranks:
+        if is_hybrid and my_rank not in iree_ranks: 
             # This is the native CUDA rank — use gpu_worker, don't touch compilation
             if vllm_config.parallel_config.worker_cls == "auto":
                 vllm_config.parallel_config.worker_cls = (
-                    "vllm.v1.worker.gpu_worker.Worker"
+                    "vllm_plugin.worker.native_wrapper.NativeWorkerWithSend"
                 )
             return
 

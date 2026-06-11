@@ -13,9 +13,12 @@ os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
 os.environ["VLLM_PLUGINS"] = "iree"
 os.environ["MASTER_ADDR"] = "127.0.0.1"
 os.environ["MASTER_PORT"] = "29500"
-os.environ["IREE_WORKER_RANKS"] = "1"  # select iree ranks
-os.environ["VLLM_PP_LAYER_PARTITION"] = "10,6"
+os.environ["IREE_CUDA_ARCH"] = "sm_86"
+os.environ["IREE_WORKER_RANKS"] = "1"  # select which ranks run iree
+os.environ["VLLM_PP_LAYER_PARTITION"] = "14,2" # layer split to ranks
 os.environ["IREE_GPU_ASSIGNMENT"]="1,0" # gpu assignment to ranks
+
+# Reminder: GPU 0 in pci bus id is A2
 
 from vllm.engine.arg_utils import EngineArgs
 from vllm.v1.core.sched.output import SchedulerOutput, CachedRequestData, NewRequestData
@@ -33,7 +36,7 @@ engine_args = EngineArgs(
     max_model_len=512,
     max_num_seqs=2,
     enforce_eager=True,
-    gpu_memory_utilization=0.6,
+    gpu_memory_utilization=0.4,
     distributed_executor_backend=(
         "vllm_plugin.executor.hybrid_executor.HybridExecutor"
     ),

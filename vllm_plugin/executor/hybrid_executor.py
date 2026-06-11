@@ -29,7 +29,8 @@ from vllm.v1.core.sched.output import SchedulerOutput
 logger = init_logger(__name__)
 
 # Worker class paths — change rank 1 to IREEWorker
-_RANK0_WORKER_CLS = "vllm.v1.worker.gpu_worker.Worker"
+# _RANK0_WORKER_CLS = "vllm.v1.worker.gpu_worker.Worker"
+_RANK0_WORKER_CLS = "vllm_plugin.worker.native_wrapper.NativeWorkerWithSend"
 _RANK1_WORKER_CLS = "vllm_plugin.worker.worker.IREEWorker"
 
 

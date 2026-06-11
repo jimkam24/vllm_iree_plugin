@@ -11,4 +11,5 @@ vllm_plugin/executor/__init__.py
 vllm_plugin/executor/hybrid_executor.py
 vllm_plugin/worker/__init__.py
 vllm_plugin/worker/model_runner.py
+vllm_plugin/worker/native_wrapper.py
 vllm_plugin/worker/worker.py

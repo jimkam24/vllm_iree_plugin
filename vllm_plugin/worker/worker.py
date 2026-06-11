@@ -20,6 +20,7 @@ from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
 from vllm.v1.outputs import ModelRunnerOutput, EMPTY_MODEL_RUNNER_OUTPUT
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.logger import init_logger
+import sys
  
 from vllm_plugin.worker.model_runner import IREEModelRunner
  
@@ -151,6 +152,14 @@ class IREEWorker(WorkerBase):
                 all_gather_group=get_tp_group(),
                 all_gather_tensors={},
             )
+        
+            print(f'[IREEWorker recv] keys={list(tensor_dict.keys())} shapes={[v.shape for v in tensor_dict.values()]}', file=sys.stderr, flush=True)
+            
+            hs = tensor_dict['hidden_states']
+            res = tensor_dict['residual']
+            combined = hs + res
+            print(f'[IREEWorker] hidden mean={hs.float().mean():.6f} residual mean={res.float().mean():.6f} combined mean={combined.float().mean():.6f}', file=sys.stderr, flush=True)
+            
             intermediate_tensors = tensor_dict  # pass to model runner later
 
         # ── Run forward pass ──────────────────────────────────────────────
@@ -167,18 +176,18 @@ class IREEWorker(WorkerBase):
         # output is IntermediateTensors when we are not the last rank
         if not pp_group.is_last_rank:
             from vllm.distributed.parallel_state import get_tp_group
-            # TODO (Step 3b): send real intermediate tensors from IREE partial forward.
-            # For now send a zero tensor of the correct hidden state shape so the
-            # native worker can proceed (output will be garbage but wiring is tested).
-            hidden_size = self.model_config.hf_config.hidden_size
-            num_tokens = scheduler_output.total_num_scheduled_tokens
-            stub_hidden = torch.zeros(
-                num_tokens, hidden_size,
-                dtype=torch.float32,
-                device=self.device,
-            )
+            # output is {"hidden_states": tensor} from model runner
+            if isinstance(output, dict) and "hidden_states" in output:
+                send_dict = output
+            else:
+                # fallback stub
+                hidden_size = self.model_config.hf_config.hidden_size
+                num_tokens = scheduler_output.total_num_scheduled_tokens
+                send_dict = {"hidden_states": torch.zeros(
+                    num_tokens, hidden_size, dtype=torch.float32, device=self.device
+                )}
             pp_group.send_tensor_dict(
-                {"hidden_states": stub_hidden},
+                send_dict,
                 all_gather_group=get_tp_group(),
             )
             return None
