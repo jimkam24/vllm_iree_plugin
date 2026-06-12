@@ -90,6 +90,10 @@ class HybridExecutor(RayDistributedExecutor):
                     env_dict["MY_PP_RANK"] = str(rank)
                     # Send the full set string so workers can reconstruct it
                     env_dict["IREE_WORKER_RANKS"] = os.environ.get("IREE_WORKER_RANKS", "1")
+                    
+                    if os.environ.get("IREE_USE_VLLM_MODEL", "0") == "1":
+                        env_dict["IREE_USE_VLLM_MODEL"] = "1"
+                    
                 args = (all_env_vars,)
                 logger.info(
                     "HybridExecutor: injected per-rank CUDA_VISIBLE_DEVICES into "

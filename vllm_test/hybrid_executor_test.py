@@ -13,10 +13,12 @@ os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
 os.environ["VLLM_PLUGINS"] = "iree"
 os.environ["MASTER_ADDR"] = "127.0.0.1"
 os.environ["MASTER_PORT"] = "29500"
-os.environ["IREE_CUDA_ARCH"] = "sm_86"
-os.environ["IREE_WORKER_RANKS"] = "1"  # select which ranks run iree
+os.environ["IREE_CUDA_ARCH"] = "sm_70"
+os.environ["IREE_WORKER_RANKS"] = "0"  # select which ranks run iree
 os.environ["VLLM_PP_LAYER_PARTITION"] = "14,2" # layer split to ranks
 os.environ["IREE_GPU_ASSIGNMENT"]="1,0" # gpu assignment to ranks
+# os.environ["IREE_FORCE_RECOMPILE"] = "1"
+os.environ["IREE_USE_VLLM_MODEL"] = "1"
 
 # Reminder: GPU 0 in pci bus id is A2
 

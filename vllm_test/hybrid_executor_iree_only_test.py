@@ -21,7 +21,7 @@ os.environ["MASTER_ADDR"] = "127.0.0.1"
 os.environ["MASTER_PORT"] = "29500"
 os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
 os.environ["IREE_WORKER_RANKS"] = "0,1"      # both ranks are IREEWorker
-os.environ["VLLM_PP_LAYER_PARTITION"] = "6,10"  # even split
+os.environ["VLLM_PP_LAYER_PARTITION"] = "14,2"  # even split
 os.environ["IREE_GPU_ASSIGNMENT"] = "0,1"    # rank 0 → GPU 0, rank 1 → GPU 1
 
 from vllm.engine.arg_utils import EngineArgs

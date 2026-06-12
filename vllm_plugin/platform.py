@@ -78,10 +78,17 @@ class IREEPlatform(Platform):
         
     @classmethod
     def get_attn_backend_cls(cls, selected_backend, attn_selector_config) -> str:
-        # Backend is set directly via attention_config.backend in HybridExecutor
-        # for multi-rank setups. This fallback handles single-worker mode.
-        return "vllm_plugin.attention.attention.IREEAttentionBackend"
-    
+        import os
+        my_rank = int(os.environ.get("MY_PP_RANK", "0"))
+        iree_ranks = set(
+            int(x.strip())
+            for x in os.environ.get("IREE_WORKER_RANKS", "1").split(",")
+        )
+        if my_rank in iree_ranks:
+            return "vllm_plugin.attention.attention.IREEAttentionBackend"
+        # Native rank — use Triton
+        return "vllm.v1.attention.backends.triton_attn.TritonAttentionBackend"
+
     @classmethod
     def set_device(cls, device: torch.device) -> None:
         import os

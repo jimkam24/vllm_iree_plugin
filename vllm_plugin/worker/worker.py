@@ -112,11 +112,8 @@ class IREEWorker(WorkerBase):
 
 
     def initialize_from_config(self, kv_cache_config: KVCacheConfig) -> None:
-        """
-        Allocate the actual KV cache using the config the engine computed.
-        TODO (Phase 1 Step 3): wire up IREE-side KV buffer allocation here.
-        """
-        pass
+        """Allocate the actual KV cache and bind to attention layers."""
+        self.model_runner.initialize_kv_cache(kv_cache_config)
 
 
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
@@ -125,12 +122,11 @@ class IREEWorker(WorkerBase):
 
 
     def compile_or_warm_up_model(self) -> None:
-        """
-        Trigger any ahead-of-time compilation or warmup runs.
-        The .vmfb is already compiled during load_model(); this is a
-        placeholder for any additional warmup forward passes needed later.
-        """
         self.model_runner.warm_up()
+        # Only release vLLM model if using IREE/torch.compile dispatch
+        # Path A1 (IREE_USE_VLLM_MODEL=1) needs self.model for inference
+        if os.environ.get("IREE_USE_VLLM_MODEL", "0") != "1":
+            self.model_runner.release_vllm_model()
 
    
     def execute_model(
@@ -144,21 +140,44 @@ class IREEWorker(WorkerBase):
         from vllm.v1.outputs import SamplerOutput
         pp_group = get_pp_group()
         intermediate_tensors = None
+        
+        if os.environ.get("IREE_USE_VLLM_MODEL", "0") == "1":
+                    from vllm.sequence import IntermediateTensors
+                    from vllm.distributed.parallel_state import get_tp_group
+                    # Path A1: recv intermediate tensors then call vLLM model
+                    it = None
+                    if not pp_group.is_first_rank:
+                        tensor_dict = pp_group.recv_tensor_dict(
+                            all_gather_group=get_tp_group(),
+                            all_gather_tensors={},
+                        )
+                        it = IntermediateTensors(tensor_dict)
+                    output = self.model_runner.execute_model(
+                        scheduler_output, intermediate_tensors=it
+                    )
+                    if not pp_group.is_last_rank:
+                        send_dict = output.tensors if isinstance(output, IntermediateTensors) else output
+                        pp_group.send_tensor_dict(send_dict, all_gather_group=get_tp_group())
+                        return None
+                    self._last_output = output
+                    return None if not self.is_driver_worker else output
 
         # ── Receive from previous rank (if not first) ─────────────────────
         if not pp_group.is_first_rank:
             from vllm.distributed.parallel_state import get_tp_group
+            from vllm.sequence import IntermediateTensors
             tensor_dict = pp_group.recv_tensor_dict(
                 all_gather_group=get_tp_group(),
                 all_gather_tensors={},
             )
+            intermediate_tensors = IntermediateTensors(tensor_dict)
         
-            print(f'[IREEWorker recv] keys={list(tensor_dict.keys())} shapes={[v.shape for v in tensor_dict.values()]}', file=sys.stderr, flush=True)
+            # print(f'[IREEWorker recv] keys={list(tensor_dict.keys())} shapes={[v.shape for v in tensor_dict.values()]}', file=sys.stderr, flush=True)
             
-            hs = tensor_dict['hidden_states']
-            res = tensor_dict['residual']
-            combined = hs + res
-            print(f'[IREEWorker] hidden mean={hs.float().mean():.6f} residual mean={res.float().mean():.6f} combined mean={combined.float().mean():.6f}', file=sys.stderr, flush=True)
+            # hs = tensor_dict['hidden_states']
+            # res = tensor_dict['residual']
+            # combined = hs + res
+            # print(f'[IREEWorker] hidden mean={hs.float().mean():.6f} residual mean={res.float().mean():.6f} combined mean={combined.float().mean():.6f}', file=sys.stderr, flush=True)
             
             intermediate_tensors = tensor_dict  # pass to model runner later
 
