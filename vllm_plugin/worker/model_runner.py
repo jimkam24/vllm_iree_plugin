@@ -29,7 +29,6 @@ Four wrapper variants based on PP rank position:
 
 import os
 import torch
-import sys
 import torch.nn as nn
 import torch.export as torch_export
 import numpy as np
@@ -502,6 +501,12 @@ class IREEModelRunner:
             self.is_first_rank = True
             self.is_last_rank = True
 
+        if os.environ.get("IREE_USE_FFN", "0") == "1":
+            self._compile_mlp_iree()
+            return  # skip full layer vmfb loading — not needed for Path A2
+        elif os.environ.get("IREE_USE_CPU_FFN", "0") == "1":
+            self._patch_mlp_cpu()
+
         vmfb_path = self._vmfb_path()
         mlir_path = self._mlir_path()
 
@@ -611,9 +616,6 @@ class IREEModelRunner:
 
     def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
         from vllm.v1.worker.gpu_model_runner import bind_kv_cache
-        from vllm.v1.kv_cache_interface import KVCacheConfig
-        
-
 
         self.kv_cache_config = kv_cache_config
         self.kv_caches: list[torch.Tensor] = []
@@ -637,10 +639,6 @@ class IREEModelRunner:
             kv_caches[layer_name] = kv_tensor
 
         forward_context = self.vllm_config.compilation_config.static_forward_context
-        print(f"[IREEModelRunner] initialize_kv_cache: "
-            f"num_blocks={kv_cache_config.num_blocks} "
-            f"forward_context keys={list(forward_context.keys())[:3]}",
-            file=sys.stderr, flush=True)
 
         bind_kv_cache(
             kv_caches=kv_caches,
@@ -681,11 +679,18 @@ class IREEModelRunner:
             self.requests.pop(req_id, None)
 
         for req in scheduler_output.scheduled_new_reqs:
+            block_ids_flat = []
+            if req.block_ids:
+                ids = (req.block_ids[0]
+                    if isinstance(req.block_ids[0], (list, tuple))
+                    else req.block_ids)
+                block_ids_flat = list(ids)
             self.requests[req.req_id] = {
                 "prompt_token_ids": req.prompt_token_ids,
                 "num_computed_tokens": 0,
+                "block_ids": block_ids_flat,  # ← store for decode
             }
-
+            
         cached = scheduler_output.scheduled_cached_reqs
         for i, req_id in enumerate(cached.req_ids):
             if req_id in self.requests:
@@ -790,40 +795,79 @@ class IREEModelRunner:
         from vllm.distributed.parallel_state import get_pp_group
         from vllm_plugin.attention.attention import IREEAttentionMetadata
 
-        if intermediate_tensors is not None:
-            import sys
-            for k, v in intermediate_tensors.tensors.items():
-                print(f"[PathA1] received {k}: shape={v.shape} mean={v.float().mean().item():.6f}",
-                    file=sys.stderr, flush=True)
-
-
         num_tokens = input_ids.shape[0]
         block_size = self.cache_config.block_size
+        max_blocks = (
+            self.vllm_config.model_config.max_model_len + block_size - 1
+        ) // block_size
 
-        # Build slot_mapping
-        slot_mapping = torch.arange(num_tokens, dtype=torch.int64, device=self.device)
+        # Determine prefill vs decode
+        # Prefill: new requests being processed for the first time
+        # Decode: cached requests generating next token
+        new_reqs = scheduler_output.scheduled_new_reqs
+        cached_reqs = scheduler_output.scheduled_cached_reqs
+        num_new = len(new_reqs)
+        num_cached = len(cached_reqs.req_ids)
+        num_reqs = num_new + num_cached
 
-        # Build block_table
-        max_blocks = (self.vllm_config.model_config.max_model_len + block_size - 1) // block_size
-        block_table = torch.zeros(1, max_blocks, dtype=torch.int32, device=self.device)
-        if scheduler_output.scheduled_new_reqs:
-            block_ids = scheduler_output.scheduled_new_reqs[0].block_ids
-            if block_ids:
-                ids = block_ids[0] if isinstance(block_ids[0], (list, tuple)) else block_ids
+        # is_prefill: true if any request has query_len > 1
+        is_prefill = (num_tokens > num_reqs)
+
+        # Build slot_mapping, block_table, seq_lens
+        slot_mapping_list: list[int] = []
+        seq_lens_list: list[int] = []
+        block_table = torch.zeros(
+            num_reqs, max_blocks, dtype=torch.int32, device=self.device
+        )
+
+        req_idx = 0
+        for req in new_reqs:
+            state = self.requests.get(req.req_id, {})
+            start = state.get("num_computed_tokens", 0)
+            query_len = len(req.prompt_token_ids) - start
+            seq_len = len(req.prompt_token_ids)  # full sequence length
+            seq_lens_list.append(seq_len)
+            # slot_mapping: sequential slots starting from 0 for prefill
+            for s in range(start, start + query_len):
+                slot_mapping_list.append(s)
+            # block_table from request's block_ids
+            if req.block_ids:
+                ids = (req.block_ids[0]
+                    if isinstance(req.block_ids[0], (list, tuple))
+                    else req.block_ids)
                 for i, bid in enumerate(list(ids)[:max_blocks]):
-                    block_table[0, i] = int(bid)
+                    block_table[req_idx, i] = int(bid)
+            req_idx += 1
 
-        seq_lens = torch.tensor([num_tokens], dtype=torch.int32, device=self.device)
+        for i, req_id in enumerate(cached_reqs.req_ids):
+            state = self.requests.get(req_id, {})
+            n_computed = state.get("num_computed_tokens", 0)
+            # seq_len = all tokens computed so far + 1 new token
+            seq_len = n_computed + 1
+            seq_lens_list.append(seq_len)
+            # slot for the new token = n_computed position
+            slot_mapping_list.append(n_computed)
+            # block_table: use blocks stored during prefill in request state
+            stored_block_ids = state.get("block_ids", [])
+            for j, bid in enumerate(stored_block_ids[:max_blocks]):
+                block_table[req_idx, j] = int(bid)
+            req_idx += 1
+
+        slot_mapping = torch.tensor(
+            slot_mapping_list, dtype=torch.int64, device=self.device
+        )
+        seq_lens = torch.tensor(
+            seq_lens_list, dtype=torch.int32, device=self.device
+        )
 
         iree_meta = IREEAttentionMetadata(
             num_actual_tokens=num_tokens,
             seq_lens=seq_lens,
             slot_mapping=slot_mapping,
             block_tables=block_table,
-            is_prefill=True,
+            is_prefill=is_prefill,
         )
 
-        # Build per-layer metadata dict for set_forward_context
         forward_context = self.vllm_config.compilation_config.static_forward_context
         attn_metadata = {layer_name: iree_meta for layer_name in forward_context}
 
@@ -837,16 +881,16 @@ class IREEModelRunner:
                 positions=positions,
                 intermediate_tensors=intermediate_tensors,
             )
-        
+
         pp = get_pp_group()
         if not pp.is_last_rank:
             return output  # IntermediateTensors — worker sends via NCCL
 
-        # Last rank: output is hidden_states [num_tokens, hidden_size]
-        # Need to compute logits via lm_head
-        hidden_states = output if isinstance(output, torch.Tensor) else output.tensors.get("hidden_states", output)
-        logits = self.model.compute_logits(hidden_states)  # [num_tokens, vocab_size]
+        hidden_states = (output if isinstance(output, torch.Tensor)
+                        else output.tensors.get("hidden_states", output))
+        logits = self.model.compute_logits(hidden_states)
 
+        # For decode: sample last token only; for prefill: also last token
         next_token_id = int(torch.argmax(logits[-1, :]).item())
         req_ids = list(self.requests.keys())
         return ModelRunnerOutput(
@@ -956,3 +1000,184 @@ class IREEModelRunner:
         else:
             # Return hidden states for next rank
             return {"hidden_states": logits}  # logits = hidden_states for non-last rank
+        
+    def _compile_mlp_iree(self) -> None:
+        import iree.turbine.aot as aot
+        import iree.compiler as iree_compiler
+        import iree.runtime as ireert
+        import numpy as np
+
+        # Determine target: GPU CUDA or CPU llvm-cpu
+        use_cpu = os.environ.get("IREE_USE_CPU_FFN_IREE", "0") == "1"
+        if use_cpu:
+            iree_target_backend = "llvm-cpu"
+            iree_device_str = "local-task"
+            target_arch = "host"
+            extra_args = [
+                "--iree-input-type=torch",
+                "--iree-opt-level=O3",
+                "--iree-llvmcpu-target-cpu=host",
+                "--iree-llvmcpu-target-cpu-features=host",
+                "--iree-llvmcpu-enable-vector-contract-custom-kernels",
+                "--iree-llvmcpu-reassociate-fp-reductions",
+            ]
+            suffix = "cpu"
+        else:
+            iree_target_backend = IREE_TARGET
+            iree_device_str = f"{IREE_TARGET}://0"
+            target_arch = IREE_TARGET_ARCH.get(IREE_TARGET, "sm_70")
+            extra_args = [
+                f"--iree-cuda-target={target_arch}",
+                "--iree-input-type=torch",
+            ]
+            suffix = target_arch
+
+        def make_iree_forward(fn, cfg):
+            def iree_mlp_forward(x: torch.Tensor) -> torch.Tensor:
+                x_cpu = x.detach().cpu()
+                iree_in = ireert.asdevicearray(cfg.device, x_cpu.numpy())
+                out_np = np.array(fn(iree_in))
+                return torch.from_numpy(out_np).to(x.device, x.dtype)
+            return iree_mlp_forward
+
+        seq_dim = torch.export.Dim("seq_len", min=1, max=4096)
+        hidden = self.model_config.hf_config.hidden_size
+        example = torch.randn(5, hidden)
+
+        for layer_idx in range(self.layer_start, self.layer_end):
+            model_short = self.model_config.model.replace(
+                "/", "_").replace("-", "_").lower()
+            vmfb_path = os.path.join(
+                self.vmfb_dir,
+                f"mlp_{model_short}_layer{layer_idx}_{suffix}.vmfb"
+            )
+            mlir_path = vmfb_path.replace(".vmfb", ".mlir")
+
+            layer = self.model.model.layers[layer_idx]
+            wrapper = _MLPWrapper(layer.mlp).cpu().eval()
+
+            if not os.path.exists(vmfb_path) or self.force_recompile:
+                logger.info("IREEModelRunner: compiling MLP layer %d (%s) -> %s",
+                        layer_idx, suffix, vmfb_path)
+                exported = aot.export(
+                    wrapper, args=(example,),
+                    dynamic_shapes={"x": {0: seq_dim}},
+                )
+                exported.save_mlir(mlir_path)
+                iree_compiler.tools.compile_file(
+                    mlir_path, output_file=vmfb_path,
+                    target_backends=[iree_target_backend],
+                    extra_args=extra_args,
+                )
+                logger.info("IREEModelRunner: MLP layer %d compiled.", layer_idx)
+            else:
+                logger.info("IREEModelRunner: cached MLP layer %d at %s",
+                        layer_idx, vmfb_path)
+
+            iree_config = ireert.Config(iree_device_str)
+            ctx = ireert.SystemContext(config=iree_config)
+            with open(vmfb_path, "rb") as f:
+                vmfb = f.read()
+            vm_module = ireert.VmModule.copy_buffer(ctx.instance, vmfb)
+            ctx.add_vm_module(vm_module)
+            iree_fn = ctx.modules.module["main"]
+
+            layer.mlp._original_forward = layer.mlp.forward
+            layer.mlp.forward = make_iree_forward(iree_fn, iree_config)
+            logger.info("IREEModelRunner: IREE FFN (%s) patched on layer %d",
+                    suffix, layer_idx)
+
+        logger.info(
+            "IREEModelRunner: IREE FFN dispatch (%s) active for layers %d-%d.",
+            suffix, self.layer_start, self.layer_end - 1,
+        )
+        
+        
+    
+
+    def _free_unused_layers(self) -> None:
+        """Free GPU memory by replacing unused transformer layers with Identity."""
+        import gc
+        num_layers = len(self.model.model.layers)
+        freed = 0
+        for i in list(range(0, self.layer_start)) + \
+                list(range(self.layer_end, num_layers)):
+            self.model.model.layers[i] = torch.nn.Identity()
+            freed += 1
+        gc.collect()
+        torch.cuda.empty_cache()
+        logger.info(
+            "IREEModelRunner: freed %d unused layers, keeping [%d, %d). "
+            "Call torch.cuda.memory_allocated() to verify.",
+            freed, self.layer_start, self.layer_end,
+        )
+        
+        
+    def _patch_mlp_cpu(self) -> None:
+        """
+        Move FFN weights to CPU and patch mlp.forward to run entirely on CPU.
+        Uses F.silu instead of vLLM's SiluAndMul to avoid GPU dependency.
+        """
+        import gc
+        import torch.nn.functional as F
+
+        def make_cpu_forward(mlp_module):
+            # Extract weights once — move to CPU
+            # gate_up_proj is fused [2*inter, hidden] — split manually
+            w_gate_up = mlp_module.gate_up_proj.weight.data.cpu()  # [16384, 2048]
+            w_down = mlp_module.down_proj.weight.data.cpu()        # [2048, 8192]
+            inter = w_down.shape[1]  # 8192
+
+            w_gate = w_gate_up[:inter].t()   # [2048, 8192]
+            w_up   = w_gate_up[inter:].t()   # [2048, 8192]
+            w_down_t = w_down.t()            # [8192, 2048]
+
+            def cpu_mlp_forward(x: torch.Tensor) -> torch.Tensor:
+                x_cpu = x.detach().cpu()
+                gate = F.silu(x_cpu @ w_gate)   # [n, 8192]
+                up   = x_cpu @ w_up             # [n, 8192]
+                out  = (gate * up) @ w_down_t   # [n, 2048]
+                return out.to(x.device, x.dtype)
+            return cpu_mlp_forward
+
+        for layer_idx in range(self.layer_start, self.layer_end):
+            layer = self.model.model.layers[layer_idx]
+            layer.mlp._original_forward = layer.mlp.forward
+            layer.mlp.forward = make_cpu_forward(layer.mlp)
+            logger.info("IREEModelRunner: CPU PyTorch FFN patched on layer %d",
+                    layer_idx)
+
+        gc.collect()
+        torch.cuda.empty_cache()
+        logger.info(
+            "IREEModelRunner: CPU PyTorch FFN dispatch active for layers %d-%d.",
+            self.layer_start, self.layer_end - 1,
+        )
+# ── IREE FFN dispatch ─────────────────────────────────────────────────────────
+
+class _MLPWrapper(torch.nn.Module):
+    """
+    Plain nn.Module wrapping vLLM's fused LlamaMLP for IREE export.
+    Splits gate_up_proj into separate gate and up projections.
+    Shared across all layers — same shape for all Llama 1B layers.
+    """
+    def __init__(self, mlp_vllm):
+        super().__init__()
+        import torch.nn as nn
+        w_gate_up = mlp_vllm.gate_up_proj.weight.data  # [2*inter, hidden]
+        w_down    = mlp_vllm.down_proj.weight.data      # [hidden, inter]
+        hidden    = w_down.shape[0]
+        inter     = w_down.shape[1]
+        self.gate_proj = nn.Linear(hidden, inter, bias=False)
+        self.up_proj   = nn.Linear(hidden, inter, bias=False)
+        self.down_proj = nn.Linear(inter, hidden, bias=False)
+        self.gate_proj.weight.data = w_gate_up[:inter].clone()
+        self.up_proj.weight.data   = w_gate_up[inter:].clone()
+        self.down_proj.weight.data = w_down.clone()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        gate = torch.nn.functional.silu(self.gate_proj(x))
+        up   = self.up_proj(x)
+        return self.down_proj(gate * up)
+
+

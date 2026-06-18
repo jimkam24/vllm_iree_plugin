@@ -8,7 +8,6 @@ vLLM calls this class at every step of the engine loop:
  
 import torch
 import os
-import torch.nn as nn
 from vllm.config import VllmConfig
 from vllm.utils.torch_utils import set_random_seed
 from vllm.distributed import (
@@ -20,7 +19,6 @@ from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
 from vllm.v1.outputs import ModelRunnerOutput, EMPTY_MODEL_RUNNER_OUTPUT
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.logger import init_logger
-import sys
  
 from vllm_plugin.worker.model_runner import IREEModelRunner
  
@@ -61,7 +59,7 @@ class IREEWorker(WorkerBase):
         )
 
     def init_device(self) -> None:
-        import os
+        os.environ["IREE_USE_CUSTOM_ATTN"] = "1"
         os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
         os.environ.setdefault("MASTER_PORT", "29500")
 
@@ -137,7 +135,6 @@ class IREEWorker(WorkerBase):
             return EMPTY_MODEL_RUNNER_OUTPUT
 
         from vllm.distributed.parallel_state import get_pp_group
-        from vllm.v1.outputs import SamplerOutput
         pp_group = get_pp_group()
         intermediate_tensors = None
         
@@ -170,15 +167,6 @@ class IREEWorker(WorkerBase):
                 all_gather_group=get_tp_group(),
                 all_gather_tensors={},
             )
-            intermediate_tensors = IntermediateTensors(tensor_dict)
-        
-            # print(f'[IREEWorker recv] keys={list(tensor_dict.keys())} shapes={[v.shape for v in tensor_dict.values()]}', file=sys.stderr, flush=True)
-            
-            # hs = tensor_dict['hidden_states']
-            # res = tensor_dict['residual']
-            # combined = hs + res
-            # print(f'[IREEWorker] hidden mean={hs.float().mean():.6f} residual mean={res.float().mean():.6f} combined mean={combined.float().mean():.6f}', file=sys.stderr, flush=True)
-            
             intermediate_tensors = tensor_dict  # pass to model runner later
 
         # ── Run forward pass ──────────────────────────────────────────────

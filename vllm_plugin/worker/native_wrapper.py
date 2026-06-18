@@ -1,5 +1,6 @@
-import sys
+
 from vllm.v1.worker.gpu_worker import Worker as _NativeWorker
+import os
 
 
 class NativeWorkerWithSend(_NativeWorker):
@@ -12,4 +13,6 @@ class NativeWorkerWithSend(_NativeWorker):
     For Path A1 (IREE_USE_VLLM_MODEL=1): gpu_worker.Worker already sends
     IntermediateTensors via NCCL internally. No override needed.
     """
-    pass
+    def init_device(self) -> None:
+        os.environ.pop("IREE_USE_CUSTOM_ATTN", None)
+        super().init_device()

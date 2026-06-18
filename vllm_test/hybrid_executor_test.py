@@ -13,12 +13,16 @@ os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
 os.environ["VLLM_PLUGINS"] = "iree"
 os.environ["MASTER_ADDR"] = "127.0.0.1"
 os.environ["MASTER_PORT"] = "29500"
-os.environ["IREE_CUDA_ARCH"] = "sm_70"
-os.environ["IREE_WORKER_RANKS"] = "0"  # select which ranks run iree
+os.environ["IREE_CUDA_ARCH"] = "sm_86"
+os.environ["IREE_WORKER_RANKS"] = "1"  # select which ranks run iree
 os.environ["VLLM_PP_LAYER_PARTITION"] = "14,2" # layer split to ranks
 os.environ["IREE_GPU_ASSIGNMENT"]="1,0" # gpu assignment to ranks
 # os.environ["IREE_FORCE_RECOMPILE"] = "1"
 os.environ["IREE_USE_VLLM_MODEL"] = "1"
+os.environ["IREE_USE_FFN"] = "0" # FFN with IREE (GPU default or with CPU paired with use cpu ffn iree)
+os.environ["IREE_USE_CPU_FFN"] = "1" # FFN on CPU no IREE!!
+os.environ["IREE_USE_CPU_FFN_IREE"] = "0" # FFN on CPU with IREE !
+
 
 # Reminder: GPU 0 in pci bus id is A2
 
@@ -73,6 +77,26 @@ print(f"  kv_cache_specs from {len(kv_cache_specs)} workers")
 # Step 3b: profile available memory on all workers
 available_gpu_memory = executor.determine_available_memory()
 print(f"  available_gpu_memory: {[f'{m/1e9:.2f}GB' for m in available_gpu_memory]}")
+
+
+
+# After [3] KV cache initialization, add:
+print("\n[3b] Memory usage per rank:")
+def get_mem(worker):
+    import torch, gc
+    gc.collect()
+    torch.cuda.empty_cache()
+    alloc = torch.cuda.memory_allocated(0) / 1024**3
+    name = torch.cuda.get_device_name(0)
+    return f"{name}: {alloc:.3f}GB allocated"
+mem = executor.collective_rpc(get_mem)
+for m in mem:
+    print(f"  {m}")
+
+
+
+
+
 
 # Step 3c: compute KV cache config from specs + available memory
 from vllm.v1.core.kv_cache_utils import get_kv_cache_configs

@@ -244,11 +244,11 @@ class IREEAttentionBackendImpl(AttentionImpl):
             v_s = v.unsqueeze(0).transpose(1, 2)
 
             # Use Flash Attention when available (sm_80+), falls back to math
-            with torch.backends.cuda.sdp_kernel(
-                enable_flash=True,
-                enable_math=True,
-                enable_mem_efficient=True,
-            ):
+            with torch.nn.attention.sdpa_kernel([
+                torch.nn.attention.SDPBackend.FLASH_ATTENTION,
+                torch.nn.attention.SDPBackend.EFFICIENT_ATTENTION,
+                torch.nn.attention.SDPBackend.MATH,
+            ]):
                 attn_out = F.scaled_dot_product_attention(
                     q_s, k_s, v_s,
                     scale=self.scale,

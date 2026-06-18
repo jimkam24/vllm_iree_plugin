@@ -22,7 +22,7 @@ import os
 from typing import Any
 
 from vllm.logger import init_logger
-from vllm.v1.executor.ray_executor import RayDistributedExecutor, RayWorkerWrapper
+from vllm.v1.executor.ray_executor import RayDistributedExecutor
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.core.sched.output import SchedulerOutput
 
@@ -50,6 +50,17 @@ class HybridExecutor(RayDistributedExecutor):
 
     supports_pp: bool = True
 
+    def __init__(self, vllm_config, **kwargs):
+        # Parse BEFORE any env manipulation — store as instance var
+        iree_ranks_str = os.environ.get("IREE_WORKER_RANKS", "1")
+        self._iree_worker_ranks = set(
+            int(x.strip())
+            for x in os.environ.get("IREE_WORKER_RANKS", "1").split(",")
+            if x.strip().isdigit()
+        )
+        
+        super().__init__(vllm_config, **kwargs)
+
     def _init_workers_ray(
         self,
         placement_group: "PlacementGroup",
@@ -66,16 +77,18 @@ class HybridExecutor(RayDistributedExecutor):
         by temporarily monkey-patching _init_workers_ray to intercept
         the all_kwargs list.
         """
+        
+        # Parse ONCE from the original env before any Ray manipulation
+        iree_ranks_str = os.environ.get("IREE_WORKER_RANKS", "1")
+        iree_worker_ranks = self._iree_worker_ranks 
+        
         # Store original collective_rpc so we can intercept init_worker
         original_collective_rpc = self.collective_rpc
 
         def patched_collective_rpc(method, timeout=None, args=(), kwargs=None,
                                     non_block=False, **kw):
             # Parse IREE worker ranks once at the top — supports multiple IREE ranks
-            iree_worker_ranks = set(
-                int(x.strip())
-                for x in os.environ.get("IREE_WORKER_RANKS", "1").split(",")
-            )
+            import sys
 
             if method == "update_environment_variables" and args:
                 all_env_vars = list(args[0])
@@ -89,10 +102,23 @@ class HybridExecutor(RayDistributedExecutor):
                         env_dict["CUDA_VISIBLE_DEVICES"] = str(rank)
                     env_dict["MY_PP_RANK"] = str(rank)
                     # Send the full set string so workers can reconstruct it
-                    env_dict["IREE_WORKER_RANKS"] = os.environ.get("IREE_WORKER_RANKS", "1")
+                    # Encode rank set as sorted concatenated digits — no separator needed
+                    # e.g. {0,1} → "01", {1} → "1", {0} → "0", {0,1,2} → "012"
+                    ranks_str = "".join(str(r) for r in sorted(self._iree_worker_ranks))
+                    env_dict["IREE_WORKER_RANKS"] = ranks_str
                     
+                    env_dict["IREE_THIS_RANK_IS_IREE"] = "1" if rank in iree_worker_ranks else "0"
                     if os.environ.get("IREE_USE_VLLM_MODEL", "0") == "1":
                         env_dict["IREE_USE_VLLM_MODEL"] = "1"
+                    if os.environ.get("IREE_USE_FFN", "0") == "1":
+                        env_dict["IREE_USE_FFN"] = "1"  
+                    if os.environ.get("IREE_USE_CPU_FFN", "0") == "1":
+                        env_dict["IREE_USE_CPU_FFN"] = "1"
+                    if os.environ.get("IREE_USE_CPU_FFN_IREE", "0") == "1":
+                        env_dict["IREE_USE_CPU_FFN_IREE"] = "1"
+                    
+                    logger.info("rank %d IREE_WORKER_RANKS in env_dict: '%s'", 
+                    rank, env_dict.get("IREE_WORKER_RANKS", "NOT SET"))
                     
                 args = (all_env_vars,)
                 logger.info(
@@ -111,9 +137,7 @@ class HybridExecutor(RayDistributedExecutor):
                         rank,
                         wk["vllm_config"].parallel_config.worker_cls,
                     )
-
-                logger.info("HybridExecutor: injecting per-rank worker classes...")
-
+                    
                 for rank, worker_kwargs in enumerate(all_kwargs):
                     if rank in iree_worker_ranks:
                         worker_cls = _RANK1_WORKER_CLS  # IREEWorker
