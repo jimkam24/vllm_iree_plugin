@@ -73,7 +73,7 @@ if CONFIG == "1":
         model="meta-llama/Llama-3.2-1B",
         dtype="float32",
         max_model_len=512,
-        enforce_eager=False,
+        enforce_eager=True,
         pipeline_parallel_size=2,
         disable_log_stats=True,
     )
@@ -132,7 +132,7 @@ else:
         model="meta-llama/Llama-3.2-1B",
         dtype="float32",
         max_model_len=512,
-        enforce_eager=False,
+        enforce_eager=True,
         gpu_memory_utilization=0.5,
         distributed_executor_backend=(
             "vllm_plugin.executor.hybrid_executor.HybridExecutor"
