@@ -19,7 +19,6 @@ Phase 2: rank 1 points at NPU via IREE amd-aie target, same executor code.
 """
 
 import os
-from typing import Any
 
 from vllm.logger import init_logger
 from vllm.v1.executor.ray_executor import RayDistributedExecutor
@@ -52,7 +51,6 @@ class HybridExecutor(RayDistributedExecutor):
 
     def __init__(self, vllm_config, **kwargs):
         # Parse BEFORE any env manipulation — store as instance var
-        iree_ranks_str = os.environ.get("IREE_WORKER_RANKS", "1")
         self._iree_worker_ranks = set(
             int(x.strip())
             for x in os.environ.get("IREE_WORKER_RANKS", "1").split(",")
@@ -79,7 +77,6 @@ class HybridExecutor(RayDistributedExecutor):
         """
         
         # Parse ONCE from the original env before any Ray manipulation
-        iree_ranks_str = os.environ.get("IREE_WORKER_RANKS", "1")
         iree_worker_ranks = self._iree_worker_ranks 
         
         # Store original collective_rpc so we can intercept init_worker
@@ -88,7 +85,6 @@ class HybridExecutor(RayDistributedExecutor):
         def patched_collective_rpc(method, timeout=None, args=(), kwargs=None,
                                     non_block=False, **kw):
             # Parse IREE worker ranks once at the top — supports multiple IREE ranks
-            import sys
 
             if method == "update_environment_variables" and args:
                 all_env_vars = list(args[0])
@@ -106,19 +102,13 @@ class HybridExecutor(RayDistributedExecutor):
                     # e.g. {0,1} → "01", {1} → "1", {0} → "0", {0,1,2} → "012"
                     ranks_str = "".join(str(r) for r in sorted(self._iree_worker_ranks))
                     env_dict["IREE_WORKER_RANKS"] = ranks_str
-                    
-                    env_dict["IREE_THIS_RANK_IS_IREE"] = "1" if rank in iree_worker_ranks else "0"
-                    if os.environ.get("IREE_USE_VLLM_MODEL", "0") == "1":
-                        env_dict["IREE_USE_VLLM_MODEL"] = "1"
+                
                     if os.environ.get("IREE_USE_FFN", "0") == "1":
                         env_dict["IREE_USE_FFN"] = "1"  
                     if os.environ.get("IREE_USE_CPU_FFN", "0") == "1":
                         env_dict["IREE_USE_CPU_FFN"] = "1"
                     if os.environ.get("IREE_USE_CPU_FFN_IREE", "0") == "1":
                         env_dict["IREE_USE_CPU_FFN_IREE"] = "1"
-                    
-                    logger.info("rank %d IREE_WORKER_RANKS in env_dict: '%s'", 
-                    rank, env_dict.get("IREE_WORKER_RANKS", "NOT SET"))
                     
                 args = (all_env_vars,)
                 logger.info(
@@ -130,15 +120,14 @@ class HybridExecutor(RayDistributedExecutor):
                 all_kwargs = list(args[0])
                 from vllm.v1.attention.backends.registry import AttentionBackendEnum
                 import copy
-
-                for rank, wk in enumerate(all_kwargs):
+                    
+                for rank, worker_kwargs in enumerate(all_kwargs):
                     logger.info(
                         "init_worker rank %d worker_cls=%s",
                         rank,
-                        wk["vllm_config"].parallel_config.worker_cls,
+                        worker_kwargs["vllm_config"].parallel_config.worker_cls,
                     )
                     
-                for rank, worker_kwargs in enumerate(all_kwargs):
                     if rank in iree_worker_ranks:
                         worker_cls = _RANK1_WORKER_CLS  # IREEWorker
                     else:
@@ -149,7 +138,7 @@ class HybridExecutor(RayDistributedExecutor):
                     cfg.parallel_config.distributed_executor_backend = "ray"
 
                     if rank in iree_worker_ranks:
-                        cfg.attention_config.backend = AttentionBackendEnum.CUSTOM
+                        cfg.attention_config.backend = AttentionBackendEnum.TRITON_ATTN
                     else:
                         cfg.attention_config.backend = AttentionBackendEnum.TRITON_ATTN
 
@@ -211,8 +200,6 @@ class HybridExecutor(RayDistributedExecutor):
           - t_rank1 = time rank1 forward
           - record to metrics collector
         """
-        import time
-        t_start = time.perf_counter()
 
         # Phase 1: forward pass on all workers
         outputs = self.collective_rpc(
@@ -229,9 +216,6 @@ class HybridExecutor(RayDistributedExecutor):
             "sample_tokens",
             args=(None,),  # grammar_output=None (no structured output)
         )
-
-        t_elapsed_ms = (time.perf_counter() - t_start) * 1000
-        logger.debug("HybridExecutor.execute_model: %.2f ms", t_elapsed_ms)
 
         # Return the first non-empty output from sample_tokens.
         # The last PP rank produces the final ModelRunnerOutput.

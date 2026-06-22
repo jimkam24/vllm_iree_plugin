@@ -19,9 +19,9 @@ os.environ["VLLM_PP_LAYER_PARTITION"] = "14,2" # layer split to ranks
 os.environ["IREE_GPU_ASSIGNMENT"]="1,0" # gpu assignment to ranks
 # os.environ["IREE_FORCE_RECOMPILE"] = "1"
 os.environ["IREE_USE_VLLM_MODEL"] = "1"
-os.environ["IREE_USE_FFN"] = "0" # FFN with IREE (GPU default or with CPU paired with use cpu ffn iree)
+os.environ["IREE_USE_FFN"] = "1" # FFN with IREE (GPU default or with CPU paired with use cpu ffn iree)
 os.environ["IREE_USE_CPU_FFN"] = "0" # FFN on CPU no IREE!!
-os.environ["IREE_USE_CPU_FFN_IREE"] = "0" # FFN on CPU with IREE !
+os.environ["IREE_USE_CPU_FFN_IREE"] = "1" # FFN on CPU with IREE !
 # os.environ["IREE_USE_COMPILE"] = "1"
 
 

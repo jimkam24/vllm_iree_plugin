@@ -15,7 +15,7 @@ class IREEPlatform(Platform):
     _enum = PlatformEnum.OOT
     device_name: str = "cuda"
     device_type: str = "cuda"
-    simple_compile_backend: str = "eager"   # disable torch.compile
+    # simple_compile_backend: str = "eager"   # disable torch.compile
     ray_device_key: str = "GPU"                        # add this
     device_control_env_var: str = "CUDA_VISIBLE_DEVICES"  # add this
     dist_backend: str = "nccl"    # add this line
@@ -26,13 +26,11 @@ class IREEPlatform(Platform):
     def get_device_name(cls, device_id: int = 0) -> str:
         return f"iree/cuda:{device_id}" 
 
-    # TODO: in IREE pin memory probably is available
     # since IREE manages its own memory we disable it for now
     @classmethod
     def is_pin_memory_available(cls) -> bool:
         return False
 
-    # TODO WARNING: does IREE support torch.inference_mode, do we keep this?
     @classmethod
     def inference_mode(cls):
         return torch.inference_mode()
@@ -73,22 +71,17 @@ class IREEPlatform(Platform):
             vllm_config.parallel_config.worker_cls = (
                 "vllm_plugin.worker.worker.IREEWorker"
             )
-        os.environ["IREE_USE_CUSTOM_ATTN"] = "1"  # signals get_attn_backend_cls
         vllm_config.compilation_config.mode = CompilationMode.NONE
         if vllm_config.cache_config is not None:
             vllm_config.cache_config.block_size = 16
         
     @classmethod
     def get_attn_backend_cls(cls, selected_backend, attn_selector_config) -> str:
-        if os.environ.get("IREE_USE_CUSTOM_ATTN", "0") == "1":
-            return "vllm_plugin.attention.attention.IREEAttentionBackend"
         return "vllm.v1.attention.backends.triton_attn.TritonAttentionBackend"
     
     @classmethod
     def set_device(cls, device: torch.device) -> None:
-        import os
         my_rank = int(os.environ.get("MY_PP_RANK", "0"))
-        # iree_rank = int(os.environ.get("IREE_WORKER_RANKS", "1"))
         # Decode: each character is one rank digit
         # e.g. "01" → {0, 1}, "1" → {1}, "012" → {0, 1, 2}
         iree_ranks_str = os.environ.get("IREE_WORKER_RANKS", "1")

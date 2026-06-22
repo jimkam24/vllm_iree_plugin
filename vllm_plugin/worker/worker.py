@@ -1,234 +1,225 @@
 """
-IREEWorker — vLLM worker that dispatches inference to the IREE runtime.
- 
-vLLM calls this class at every step of the engine loop:
-  init_device -> load_model -> determine_available_memory ->
-  initialize_cache -> compile_or_warm_up_model -> execute_model (loop)
+IREEWorker — extends native vLLM gpu_worker with IREE/CPU FFN dispatch.
+
+All attention, KV cache, metadata, PP boundary, and torch.compile handled
+natively by gpu_worker + gpu_model_runner.
+
+IREEWorker only patches FFN layers after model loading for heterogeneous
+dispatch to IREE (GPU/CPU) or plain CPU (BLAS).
+
+Phase 1: FFN dispatch to IREE cuda or llvm-cpu target.
+Phase 2: change IREE_TARGET to amd-aie for NPU dispatch.
 """
- 
-import torch
+
 import os
-from vllm.config import VllmConfig
-from vllm.utils.torch_utils import set_random_seed
-from vllm.distributed import (
-    ensure_model_parallel_initialized,
-    init_distributed_environment,
-)
-from vllm.v1.worker.worker_base import WorkerBase
-from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
-from vllm.v1.outputs import ModelRunnerOutput, EMPTY_MODEL_RUNNER_OUTPUT
-from vllm.v1.core.sched.output import SchedulerOutput
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import numpy as np
+
+from vllm.v1.worker.gpu_worker import Worker as _NativeWorker
 from vllm.logger import init_logger
- 
-from vllm_plugin.worker.model_runner import IREEModelRunner
- 
+
 logger = init_logger(__name__)
- 
- 
-class IREEWorker(WorkerBase):
-    """
-    Execution engine that vLLM talks to at every inference step.
-    For Phase 1 this runs on a single GPU via IREE targeting cuda.
-    Phase 2 will swap the IREE compile target to something else (?).
-    """
+
+IREE_TARGET = os.environ.get("IREE_TARGET", "cuda")
+IREE_TARGET_ARCH = {
+    "cuda": os.environ.get("IREE_CUDA_ARCH", "sm_86"),
+    "amd-aie": "aie",
+}
 
 
-    # create model runner and store config
-    def __init__(
-        self,
-        vllm_config: VllmConfig,
-        local_rank: int,
-        rank: int,
-        distributed_init_method: str,
-        is_driver_worker: bool = False,
-        **kwargs,
-    ) -> None:
-        super().__init__(
-            vllm_config=vllm_config,
-            local_rank=local_rank,
-            rank=rank,
-            distributed_init_method=distributed_init_method,
-            is_driver_worker=is_driver_worker,
-        )
-        # model_runner is created here so other methods can reference it,
-        # but load_model() is where weights are actually loaded.
-        self.model_runner = IREEModelRunner(
-            self.vllm_config,
-            force_recompile=bool(os.environ.get("IREE_FORCE_RECOMPILE", "")),
-            vmfb_dir=os.environ.get("IREE_VMFB_DIR", "/tmp/iree_artifacts"),
-        )
+class IREEWorker(_NativeWorker):
+    """
+    Native gpu_worker extended with optional IREE/CPU FFN dispatch.
+
+    Without FFN flags: identical to native gpu_worker (Triton attention,
+    native gpu_model_runner, PP boundary handled natively).
+
+    With IREE_USE_FFN=1: FFN layers patched to dispatch through IREE.
+    With IREE_USE_CPU_FFN=1: FFN layers patched to run on CPU (BLAS).
+    """
 
     def init_device(self) -> None:
-        os.environ["IREE_USE_CUSTOM_ATTN"] = "1"
-        os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
-        os.environ.setdefault("MASTER_PORT", "29500")
-
-        init_distributed_environment(
-            world_size=self.parallel_config.world_size,
-            rank=self.rank,
-            distributed_init_method=self.distributed_init_method,
-            local_rank=self.local_rank,
-            backend="nccl",
-        )
-
-        ensure_model_parallel_initialized(
-            self.parallel_config.tensor_parallel_size,
-            self.parallel_config.pipeline_parallel_size,
-        )
-
-        set_random_seed(self.model_config.seed)
-        # With CUDA_VISIBLE_DEVICES=<rank>, the worker sees only 1 GPU
-        # which always appears as cuda:0 within its own process.
-        self.device = torch.device("cuda:0")
+        # Native init — no custom attention, use Triton
+        super().init_device()
         logger.info("IREEWorker: device initialised (%s)", self.device)
-    
+
     def load_model(self) -> None:
-        """Load model weights and compile to .vmfb via iree-turbine."""
-        self.model_runner.load_model()
+        """Load model via native gpu_model_runner, then patch FFN if requested."""
+        super().load_model()
+        logger.info("IREEWorker: model loaded via native gpu_model_runner.")
 
+        if os.environ.get("IREE_USE_FFN", "0") == "1":
+            self._compile_mlp_iree()
+        elif os.environ.get("IREE_USE_CPU_FFN", "0") == "1":
+            self._patch_mlp_cpu()
 
-    def determine_available_memory(self) -> int:
-        """
-        Return available memory in bytes for KV cache allocation.
-        IREE manages GPU memory internally so we can't profile it the
-        same way the native worker does. Instead we return the actual
-        free GPU memory on our device, which gives get_kv_cache_configs
-        a realistic value to work with.
-        """
-        free, total = torch.cuda.mem_get_info(0)  # cuda:0 within this process
-        # Apply gpu_memory_utilization fraction, then subtract model weights
-        usable = int(free * self.cache_config.gpu_memory_utilization)
-        return max(usable, 0)
- 
+    def _get_model(self):
+        """Access the underlying vLLM model from gpu_model_runner."""
+        return self.model_runner.model
 
-    def initialize_cache(
-        self, num_gpu_blocks: int, num_cpu_blocks: int
-    ) -> None:
-        """Store block counts that the scheduler computed."""
-        self.cache_config.num_gpu_blocks = num_gpu_blocks
-        self.cache_config.num_cpu_blocks = num_cpu_blocks
+    def _get_layer_range(self):
+        """Get layer range owned by this PP rank (set by vLLM's make_layers)."""
+        model = self._get_model()
+        return model.model.start_layer, model.model.end_layer
 
+    def _compile_mlp_iree(self) -> None:
+        """Export FFN to IREE vmfb and patch mlp.forward for dispatch."""
+        import iree.turbine.aot as aot
+        import iree.compiler as iree_compiler
+        import iree.runtime as ireert
 
-    def initialize_from_config(self, kv_cache_config: KVCacheConfig) -> None:
-        """Allocate the actual KV cache and bind to attention layers."""
-        self.model_runner.initialize_kv_cache(kv_cache_config)
+        use_cpu = os.environ.get("IREE_USE_CPU_FFN_IREE", "0") == "1"
+        if use_cpu:
+            iree_target_backend = "llvm-cpu"
+            iree_device_str = "local-task"
+            target_arch = "host"
+            extra_args = [
+                "--iree-input-type=torch",
+                "--iree-opt-level=O3",
+                "--iree-llvmcpu-target-cpu=host",
+                "--iree-llvmcpu-target-cpu-features=host",
+                "--iree-llvmcpu-enable-vector-contract-custom-kernels",
+                "--iree-llvmcpu-reassociate-fp-reductions",
+            ]
+            suffix = "cpu"
+        else:
+            iree_target_backend = IREE_TARGET
+            iree_device_str = f"{IREE_TARGET}://0"
+            target_arch = IREE_TARGET_ARCH.get(IREE_TARGET, "sm_86")
+            extra_args = [
+                f"--iree-cuda-target={target_arch}",
+                "--iree-input-type=torch",
+            ]
+            suffix = target_arch
 
+        model = self._get_model()
+        layer_start, layer_end = self._get_layer_range()
+        hidden = self.model_config.hf_config.hidden_size
+        vmfb_dir = os.environ.get("IREE_VMFB_DIR", "/tmp/iree_artifacts")
+        os.makedirs(vmfb_dir, exist_ok=True)
 
-    def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
-        """Delegate KV cache layout description to the model runner."""
-        return self.model_runner.get_kv_cache_spec()
+        seq_dim = torch.export.Dim("seq_len", min=1, max=4096)
+        example = torch.randn(5, hidden)
 
+        def make_iree_forward(fn, cfg):
+            def iree_mlp_forward(x: torch.Tensor) -> torch.Tensor:
+                x_cpu = x.detach().cpu()
+                iree_in = ireert.asdevicearray(cfg.device, x_cpu.numpy())
+                out_np = np.array(fn(iree_in))
+                return torch.from_numpy(out_np).to(x.device, x.dtype)
+            return iree_mlp_forward
 
-    def compile_or_warm_up_model(self) -> None:
-        self.model_runner.warm_up()
-        # Only release vLLM model if using IREE/torch.compile dispatch
-        # Path A1 (IREE_USE_VLLM_MODEL=1) needs self.model for inference
-        if os.environ.get("IREE_USE_VLLM_MODEL", "0") != "1":
-            self.model_runner.release_vllm_model()
-
-   
-    def execute_model(
-        self,
-        scheduler_output: SchedulerOutput,
-    ) -> ModelRunnerOutput | None:
-        if not scheduler_output.total_num_scheduled_tokens:
-            return EMPTY_MODEL_RUNNER_OUTPUT
-
-        from vllm.distributed.parallel_state import get_pp_group
-        pp_group = get_pp_group()
-        intermediate_tensors = None
-        
-        if os.environ.get("IREE_USE_VLLM_MODEL", "0") == "1":
-                    from vllm.sequence import IntermediateTensors
-                    from vllm.distributed.parallel_state import get_tp_group
-                    # Path A1: recv intermediate tensors then call vLLM model
-                    it = None
-                    if not pp_group.is_first_rank:
-                        tensor_dict = pp_group.recv_tensor_dict(
-                            all_gather_group=get_tp_group(),
-                            all_gather_tensors={},
-                        )
-                        it = IntermediateTensors(tensor_dict)
-                    output = self.model_runner.execute_model(
-                        scheduler_output, intermediate_tensors=it
-                    )
-                    if not pp_group.is_last_rank:
-                        send_dict = output.tensors if isinstance(output, IntermediateTensors) else output
-                        pp_group.send_tensor_dict(send_dict, all_gather_group=get_tp_group())
-                        return None
-                    self._last_output = output
-                    return None if not self.is_driver_worker else output
-
-        # ── Receive from previous rank (if not first) ─────────────────────
-        if not pp_group.is_first_rank:
-            from vllm.distributed.parallel_state import get_tp_group
-            from vllm.sequence import IntermediateTensors
-            tensor_dict = pp_group.recv_tensor_dict(
-                all_gather_group=get_tp_group(),
-                all_gather_tensors={},
+        for layer_idx in range(layer_start, layer_end):
+            model_short = self.model_config.model.replace(
+                "/", "_").replace("-", "_").lower()
+            vmfb_path = os.path.join(
+                vmfb_dir,
+                f"mlp_{model_short}_layer{layer_idx}_{suffix}.vmfb"
             )
-            intermediate_tensors = tensor_dict  # pass to model runner later
+            mlir_path = vmfb_path.replace(".vmfb", ".mlir")
 
-        # ── Run forward pass ──────────────────────────────────────────────
-        output = self.model_runner.execute_model(
-            scheduler_output,
-            intermediate_tensors=intermediate_tensors,
-        )
+            layer = model.model.layers[layer_idx]
+            wrapper = _MLPWrapper(layer.mlp).cpu().eval()
 
-        # Store for sample_tokens() call
-        if pp_group.is_last_rank:
-            self._last_output = output
-
-        # ── Send to next rank (if not last) ───────────────────────────────
-        # output is IntermediateTensors when we are not the last rank
-        if not pp_group.is_last_rank:
-            from vllm.distributed.parallel_state import get_tp_group
-            # output is {"hidden_states": tensor} from model runner
-            if isinstance(output, dict) and "hidden_states" in output:
-                send_dict = output
+            force_recompile = bool(os.environ.get("IREE_FORCE_RECOMPILE", ""))
+            if not os.path.exists(vmfb_path) or force_recompile:
+                logger.info("IREEWorker: compiling MLP layer %d (%s) -> %s",
+                           layer_idx, suffix, vmfb_path)
+                exported = aot.export(
+                    wrapper, args=(example,),
+                    dynamic_shapes={"x": {0: seq_dim}},
+                )
+                exported.save_mlir(mlir_path)
+                iree_compiler.tools.compile_file(
+                    mlir_path, output_file=vmfb_path,
+                    target_backends=[iree_target_backend],
+                    extra_args=extra_args,
+                )
+                logger.info("IREEWorker: MLP layer %d compiled.", layer_idx)
             else:
-                # fallback stub
-                hidden_size = self.model_config.hf_config.hidden_size
-                num_tokens = scheduler_output.total_num_scheduled_tokens
-                send_dict = {"hidden_states": torch.zeros(
-                    num_tokens, hidden_size, dtype=torch.float32, device=self.device
-                )}
-            pp_group.send_tensor_dict(
-                send_dict,
-                all_gather_group=get_tp_group(),
-            )
-            return None
+                logger.info("IREEWorker: cached MLP layer %d at %s",
+                           layer_idx, vmfb_path)
 
-        # ── Last rank returns final output ────────────────────────────────
-        return output if self.is_driver_worker else None
-    
-    def sample_tokens(self, grammar_output: object) -> object:
-        # For IREE as last rank: output was already computed in execute_model.
-        # For IREE as first rank: no sampling needed, return empty.
-        from vllm.distributed.parallel_state import get_pp_group
-        if get_pp_group().is_last_rank:
-            # Return the stored output from the last execute_model call
-            output = getattr(self, '_last_output', EMPTY_MODEL_RUNNER_OUTPUT)
-            self._last_output = None
-            return output
-        return EMPTY_MODEL_RUNNER_OUTPUT
-    
-    #TODO: ping IREE worker to see if it still is ok
+            iree_config = ireert.Config(iree_device_str)
+            ctx = ireert.SystemContext(config=iree_config)
+            with open(vmfb_path, "rb") as f:
+                vmfb = f.read()
+            vm_module = ireert.VmModule.copy_buffer(ctx.instance, vmfb)
+            ctx.add_vm_module(vm_module)
+            iree_fn = ctx.modules.module["main"]
+
+            layer.mlp._original_forward = layer.mlp.forward
+            layer.mlp.forward = make_iree_forward(iree_fn, iree_config)
+            logger.info("IREEWorker: IREE FFN (%s) patched on layer %d",
+                       suffix, layer_idx)
+
+        logger.info("IREEWorker: IREE FFN dispatch (%s) active for layers %d-%d.",
+                   suffix, layer_start, layer_end - 1)
+
+    def _patch_mlp_cpu(self) -> None:
+        """Move FFN weights to CPU and patch mlp.forward to run on CPU (BLAS)."""
+        import gc
+
+        model = self._get_model()
+        layer_start, layer_end = self._get_layer_range()
+
+        def make_cpu_forward(mlp_module):
+            w_gate_up = mlp_module.gate_up_proj.weight.data.cpu()
+            w_down = mlp_module.down_proj.weight.data.cpu()
+            inter = w_down.shape[1]
+            w_gate = w_gate_up[:inter].t()
+            w_up   = w_gate_up[inter:].t()
+            w_down_t = w_down.t()
+
+            def cpu_mlp_forward(x: torch.Tensor) -> torch.Tensor:
+                x_cpu = x.detach().cpu()
+                gate = F.silu(x_cpu @ w_gate)
+                up   = x_cpu @ w_up
+                out  = (gate * up) @ w_down_t
+                return out.to(x.device, x.dtype)
+            return cpu_mlp_forward
+
+        for layer_idx in range(layer_start, layer_end):
+            layer = model.model.layers[layer_idx]
+            layer.mlp._original_forward = layer.mlp.forward
+            layer.mlp.forward = make_cpu_forward(layer.mlp)
+            logger.info("IREEWorker: CPU FFN patched on layer %d", layer_idx)
+
+        gc.collect()
+        torch.cuda.empty_cache()
+        logger.info("IREEWorker: CPU FFN active for layers %d-%d.",
+                   layer_start, layer_end - 1)
+
     def check_health(self) -> None:
         from vllm.distributed.parallel_state import get_pp_group
         pp = get_pp_group()
-        print(f"[check_health rank={self.rank}] pp.rank_in_group={pp.rank_in_group} pp.world_size={pp.world_size} is_last={pp.is_last_rank}", flush=True)
         logger.info(
-            "check_health: rank=%d pp.ranks=%s pp.world_size=%d "
-            "is_first=%s is_last=%s",
-            self.rank, pp.ranks, pp.world_size,
-            pp.is_first_rank, pp.is_last_rank,
+            "IREEWorker check_health: rank=%d is_first=%s is_last=%s",
+            self.rank, pp.is_first_rank, pp.is_last_rank,
         )
 
 
-    
+# ── MLP wrapper for IREE export ───────────────────────────────────────────────
 
-# Future (Phase 3 HybridExecutor)
-#
-# _init_worker_distributed_environment  — explicit multi-device init
-# profile                               — torch profiler hook
+class _MLPWrapper(nn.Module):
+    """Plain nn.Module for IREE AOT export — splits fused gate_up_proj."""
+
+    def __init__(self, mlp_vllm):
+        super().__init__()
+        w_gate_up = mlp_vllm.gate_up_proj.weight.data
+        w_down    = mlp_vllm.down_proj.weight.data
+        hidden    = w_down.shape[0]
+        inter     = w_down.shape[1]
+        self.gate_proj = nn.Linear(hidden, inter, bias=False)
+        self.up_proj   = nn.Linear(hidden, inter, bias=False)
+        self.down_proj = nn.Linear(inter, hidden, bias=False)
+        self.gate_proj.weight.data = w_gate_up[:inter].clone()
+        self.up_proj.weight.data   = w_gate_up[inter:].clone()
+        self.down_proj.weight.data = w_down.clone()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        gate = F.silu(self.gate_proj(x))
+        up   = self.up_proj(x)
+        return self.down_proj(gate * up)
