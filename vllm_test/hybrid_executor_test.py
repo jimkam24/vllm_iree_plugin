@@ -19,9 +19,9 @@ os.environ["VLLM_PP_LAYER_PARTITION"] = "14,2" # layer split to ranks
 os.environ["IREE_GPU_ASSIGNMENT"]="1,0" # gpu assignment to ranks
 # os.environ["IREE_FORCE_RECOMPILE"] = "1"
 os.environ["IREE_USE_VLLM_MODEL"] = "1"
-os.environ["IREE_USE_FFN"] = "1" # FFN with IREE (GPU default or with CPU paired with use cpu ffn iree)
+os.environ["IREE_USE_FFN"] = "0" # FFN with IREE (GPU default or with CPU paired with use cpu ffn iree)
 os.environ["IREE_USE_CPU_FFN"] = "0" # FFN on CPU no IREE!!
-os.environ["IREE_USE_CPU_FFN_IREE"] = "1" # FFN on CPU with IREE !
+os.environ["IREE_USE_CPU_FFN_IREE"] = "0" # FFN on CPU with IREE !
 # os.environ["IREE_USE_COMPILE"] = "1"
 
 
@@ -30,6 +30,7 @@ os.environ["IREE_USE_CPU_FFN_IREE"] = "1" # FFN on CPU with IREE !
 from vllm.engine.arg_utils import EngineArgs
 from vllm.v1.core.sched.output import SchedulerOutput, CachedRequestData, NewRequestData
 from vllm.sampling_params import SamplingParams
+from vllm.config.compilation import CUDAGraphMode
 
 print("=" * 60)
 print("HybridExecutor Smoke Test")
@@ -41,18 +42,20 @@ engine_args = EngineArgs(
     model="meta-llama/Llama-3.2-1B",
     dtype="float32",
     max_model_len=512,
-    max_num_seqs=2,
+    max_num_seqs=4,
     enforce_eager=True,
     gpu_memory_utilization=0.4,
-    distributed_executor_backend=(
-        "vllm_plugin.executor.hybrid_executor.HybridExecutor"
-    ),
+    pipeline_parallel_size=2,
+    distributed_executor_backend="ray",  # ← tell vLLM it's Ray
 )
 vllm_config = engine_args.create_engine_config()
 # Override PP after config creation to bypass vLLM's executor check
-vllm_config.parallel_config.pipeline_parallel_size = 2
-vllm_config.parallel_config.world_size = 2
-print("  OK")
+# vllm_config.parallel_config.pipeline_parallel_size = 2
+# vllm_config.parallel_config.world_size = 2
+# print("  OK")
+vllm_config.parallel_config.distributed_executor_backend = \
+    "vllm_plugin.executor.hybrid_executor.HybridExecutor"
+vllm_config.compilation_config.cudagraph_mode = CUDAGraphMode.NONE
 
 # ── 2. Instantiate HybridExecutor (creates + inits both workers) ──────────────
 print("\n[2] Instantiating HybridExecutor...")

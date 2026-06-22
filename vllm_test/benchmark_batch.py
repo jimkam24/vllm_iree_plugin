@@ -57,6 +57,28 @@ elif CONFIG == "4":
     os.environ["IREE_WORKER_RANKS"] = "0"
     os.environ["IREE_USE_VLLM_MODEL"] = "1"
     config_name = "custom-vLLM (SDPA rank0 + Triton rank1)"
+elif CONFIG == "5":  # Config 2 + CPU FFN
+    os.environ["VLLM_PLUGINS"] = "iree"
+    os.environ["IREE_WORKER_RANKS"] = "1"
+    os.environ["IREE_USE_VLLM_MODEL"] = "1"
+    os.environ["IREE_USE_CPU_FFN"] = "1"
+    os.environ["IREE_USE_FFN"] = "1"
+    os.environ["IREE_CUDA_ARCH"] = "sm_86"
+    config_name = "vLLM-custom (native Triton + IREEWorker CPU IREE FFN)"
+elif CONFIG == "6":  # Config 2 + CPU FFN
+    os.environ["VLLM_PLUGINS"] = "iree"
+    os.environ["IREE_WORKER_RANKS"] = "1"
+    os.environ["IREE_USE_VLLM_MODEL"] = "1"
+    os.environ["IREE_USE_CPU_FFN"] = "1"
+    os.environ["IREE_CUDA_ARCH"] = "sm_86"
+    config_name = "vLLM-custom (native Triton + IREEWorker CPU FFN)"
+elif CONFIG == "7":  # Config 2 + CPU FFN
+    os.environ["VLLM_PLUGINS"] = "iree"
+    os.environ["IREE_WORKER_RANKS"] = "1"
+    os.environ["IREE_USE_VLLM_MODEL"] = "1"
+    os.environ["IREE_USE_FFN"] = "1"
+    os.environ["IREE_CUDA_ARCH"] = "sm_86"
+    config_name = "vLLM-custom (native Triton + IREEWorker GPU FFN)"
 else:
     print(f"Unknown config {CONFIG}. Use 1r, 2, 3, or 4.")
     sys.exit(1)
