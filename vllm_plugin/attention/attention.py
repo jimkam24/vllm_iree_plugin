@@ -67,7 +67,7 @@ class IREEAttentionBackend(AttentionBackend):
         cache_type: str = "",
         cache_dtype_str: str = "",
     ) -> tuple[int, ...]:
-        return (2, num_blocks, block_size, num_kv_heads, head_size)
+        return (num_blocks, 2, block_size, num_kv_heads, head_size)
 
     @staticmethod
     def swap_blocks(

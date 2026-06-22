@@ -191,6 +191,16 @@ class IREEWorker(_NativeWorker):
         torch.cuda.empty_cache()
         logger.info("IREEWorker: CPU FFN active for layers %d-%d.",
                    layer_start, layer_end - 1)
+        
+    def execute_model(self, scheduler_output):
+        output = super().execute_model(scheduler_output)
+        if self.model_runner.input_batch is not None:
+            for req in scheduler_output.scheduled_new_reqs:
+                req_idx = self.model_runner.input_batch.req_id_to_index.get(req.req_id)
+                if req_idx is not None:
+                    n_tokens = len(req.prompt_token_ids)
+                    self.model_runner.input_batch.num_tokens_no_spec[req_idx] = n_tokens
+        return output
 
     def check_health(self) -> None:
         from vllm.distributed.parallel_state import get_pp_group

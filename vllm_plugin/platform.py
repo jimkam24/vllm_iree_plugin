@@ -15,10 +15,9 @@ class IREEPlatform(Platform):
     _enum = PlatformEnum.OOT
     device_name: str = "cuda"
     device_type: str = "cuda"
-    # simple_compile_backend: str = "eager"   # disable torch.compile
-    ray_device_key: str = "GPU"                        # add this
-    device_control_env_var: str = "CUDA_VISIBLE_DEVICES"  # add this
-    dist_backend: str = "nccl"    # add this line
+    ray_device_key: str = "GPU"                        
+    device_control_env_var: str = "CUDA_VISIBLE_DEVICES"  
+    dist_backend: str = "nccl"    
 
 
     # identifier for the custom backend
@@ -42,7 +41,7 @@ class IREEPlatform(Platform):
     # will be called before config is built, patch the arg patcher
     @classmethod
     def pre_register_and_update(cls, parser=None) -> None:
-        pass  # TODO: add arg parser patches here later (IREE-specific CLI flags here later if needed)
+        pass
 
     # here we set worker class, tweak scheduler, block size, compilation mode etc
     @classmethod

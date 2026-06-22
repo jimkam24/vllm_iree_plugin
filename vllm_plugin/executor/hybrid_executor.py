@@ -28,7 +28,6 @@ from vllm.v1.core.sched.output import SchedulerOutput
 logger = init_logger(__name__)
 
 # Worker class paths — change rank 1 to IREEWorker
-# _RANK0_WORKER_CLS = "vllm.v1.worker.gpu_worker.Worker"
 _RANK0_WORKER_CLS = "vllm_plugin.worker.native_wrapper.NativeWorkerWithSend"
 _RANK1_WORKER_CLS = "vllm_plugin.worker.worker.IREEWorker"
 
@@ -122,11 +121,6 @@ class HybridExecutor(RayDistributedExecutor):
                 import copy
                     
                 for rank, worker_kwargs in enumerate(all_kwargs):
-                    logger.info(
-                        "init_worker rank %d worker_cls=%s",
-                        rank,
-                        worker_kwargs["vllm_config"].parallel_config.worker_cls,
-                    )
                     
                     if rank in iree_worker_ranks:
                         worker_cls = _RANK1_WORKER_CLS  # IREEWorker
@@ -137,10 +131,7 @@ class HybridExecutor(RayDistributedExecutor):
                     cfg.parallel_config.worker_cls = worker_cls
                     cfg.parallel_config.distributed_executor_backend = "ray"
 
-                    if rank in iree_worker_ranks:
-                        cfg.attention_config.backend = AttentionBackendEnum.TRITON_ATTN
-                    else:
-                        cfg.attention_config.backend = AttentionBackendEnum.TRITON_ATTN
+                    cfg.attention_config.backend = AttentionBackendEnum.TRITON_ATTN
 
                     if cfg.additional_config is None:
                         cfg.additional_config = {}
@@ -187,12 +178,6 @@ class HybridExecutor(RayDistributedExecutor):
         Current (Phase 1 baseline):
           Both workers run full forward independently.
           Output comes from rank 0 (driver worker).
-
-        TODO (Step 3b — activation passing):
-          1. Rank 0 runs layers [0, split) → produces intermediate activations
-          2. Transfer activations rank0 → rank1 via gloo
-          3. Rank 1 runs layers [split, N) → produces logits + sampled tokens
-          4. Return rank1 output
 
         Profiling hooks for Step 4 go here:
           - t_rank0 = time rank0 forward

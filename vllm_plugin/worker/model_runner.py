@@ -632,7 +632,7 @@ class IREEModelRunner:
         for layer_idx in range(self.layer_start, self.layer_end):
             layer_name = f"model.layers.{layer_idx}.self_attn.attn"
             kv_tensor = torch.zeros(
-                2, num_blocks, block_size, num_kv_heads, head_size,
+                num_blocks, 2, block_size, num_kv_heads, head_size,
                 dtype=torch.float32,
                 device=self.device,
             )
