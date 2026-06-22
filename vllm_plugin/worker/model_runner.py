@@ -10,20 +10,6 @@ Key features:
   - .vmfb cached on disk, reloaded on subsequent runs
   - force_recompile flag for full control
   - causal mask patch for transformers >= 4.56.0 compatibility
-  
-  
-Step 3b replacement functions for model_runner.py.
- 
-Replace the following in model_runner.py:
-  - _export_and_compile()  → rank-aware version below
-  - _run_iree()            → two-input version below
-  - execute_model()        → wires intermediate_tensors below
- 
-Four wrapper variants based on PP rank position:
-  FullModel   (first+last): input_ids → logits         (single worker)
-  FirstRank   (first only): input_ids → hidden_states  (sends to next)
-  MiddleRank  (neither):    hidden_states, pos → hidden (passes through)
-  LastRank    (last only):  hidden_states, pos → logits (final output)
 
 """
 
@@ -557,18 +543,6 @@ class IREEModelRunner:
                     fcntl.flock(lf, fcntl.LOCK_EX)
                     try:
                         from transformers import AutoModelForCausalLM
-                        # hf_model_pt = AutoModelForCausalLM.from_pretrained(
-                        #     self.model_config.model,
-                        #     torch_dtype=torch.float32,
-                        #     attn_implementation="eager",
-                        # ).to(self.device).eval()
-                        # pt_wrapper = _build_wrapper(
-                        #     hf_model_pt,
-                        #     self.layer_start, self.layer_end,
-                        #     self.is_first_rank, self.is_last_rank,
-                        # ).to(self.device).eval()
-                        # del hf_model_pt
-                        
                         hf_model_pt = AutoModelForCausalLM.from_pretrained(
                             self.model_config.model,
                             torch_dtype=torch.float32,
@@ -730,33 +704,8 @@ class IREEModelRunner:
         )
         pos = torch.tensor(positions, dtype=torch.long, device=self.device)
         return input_ids, pos
-    
-    def release_vllm_model(self) -> None:
-        """Free the vLLM model after warmup — IREE vmfb handles inference."""
-        if self.model is not None:
-            import gc
-            del self.model
-            self.model = None
-            gc.collect()
-            torch.cuda.empty_cache()
-            logger.info("IREEModelRunner: vLLM model released, GPU memory freed.")
 
     # ── IREE dispatch ─────────────────────────────────────────────────────────
-
-    # def _run_iree(
-    #     self,
-    #     input_ids: torch.Tensor,
-    #     hidden_states: torch.Tensor | None = None,
-    #     position_ids: torch.Tensor | None = None,
-    # ) -> torch.Tensor:
-    #     if self.is_first_rank or (self.is_first_rank and self.is_last_rank):
-    #         return _run_iree_first_or_full(
-    #             self.iree_config, self.iree_fn, input_ids
-    #         )
-    #     else:
-    #         return _run_iree_middle_or_last(
-    #             self.iree_config, self.iree_fn, hidden_states, position_ids
-    #         )
 
     def _run_iree(
         self,
@@ -897,59 +846,6 @@ class IREEModelRunner:
             req_ids=req_ids,
             req_id_to_index={r: i for i, r in enumerate(req_ids)},
             sampled_token_ids=[[next_token_id]] * len(req_ids),
-        )
-
-
-    def _build_common_attn_metadata(
-        self,
-        scheduler_output: SchedulerOutput,
-        input_ids: torch.Tensor,
-        positions: torch.Tensor,
-    ) -> "CommonAttentionMetadata":
-
-        num_tokens = input_ids.shape[0]
-        num_reqs = len(scheduler_output.scheduled_new_reqs) + len(
-            scheduler_output.scheduled_cached_reqs.req_ids
-        )
-
-        # query_start_loc: [0, num_tokens] for single request
-        query_start_loc = torch.tensor(
-            [0, num_tokens], dtype=torch.int32, device=self.device
-        )
-        query_start_loc_cpu = query_start_loc.cpu()
-
-        seq_lens = torch.tensor(
-            [num_tokens], dtype=torch.int32, device=self.device
-        )
-
-        # slot_mapping: sequential slots for prefill
-        slot_mapping = torch.arange(
-            num_tokens, dtype=torch.int64, device=self.device
-        )
-
-        # block_table: get from scheduled request block_ids
-        block_size = self.cache_config.block_size
-        max_blocks = (512 + block_size - 1) // block_size  # max_model_len / block_size
-        block_table = torch.zeros(
-            1, max_blocks, dtype=torch.int32, device=self.device
-        )
-        if scheduler_output.scheduled_new_reqs:
-            req = scheduler_output.scheduled_new_reqs[0]
-            block_ids = req.block_ids[0] if req.block_ids else []
-            for i, bid in enumerate(block_ids[:max_blocks]):
-                block_table[0, i] = bid
-
-        return CommonAttentionMetadata(
-            query_start_loc=query_start_loc,
-            query_start_loc_cpu=query_start_loc_cpu,
-            seq_lens=seq_lens,
-            num_reqs=num_reqs,
-            num_actual_tokens=num_tokens,
-            max_query_len=num_tokens,
-            max_seq_len=num_tokens,
-            block_table_tensor=block_table,
-            slot_mapping=slot_mapping,
-            causal=True,
         )
 
     # ── Main inference entry point ────────────────────────────────────────────
@@ -1095,6 +991,7 @@ class IREEModelRunner:
         
     
 
+    # currently not used, keeping it for now in case it is needed --> else remove
     def _free_unused_layers(self) -> None:
         """Free GPU memory by replacing unused transformer layers with Identity."""
         import gc

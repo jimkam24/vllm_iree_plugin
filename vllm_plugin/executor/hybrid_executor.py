@@ -144,10 +144,6 @@ class HybridExecutor(RayDistributedExecutor):
                         "local_rank": 0,
                         "is_driver_worker": (rank == len(all_kwargs) - 1),
                     }
-                    logger.info(
-                        "  rank %d -> %s (layers: hybrid_pp_rank=%d/%d)",
-                        rank, worker_cls, rank, len(all_kwargs),
-                    )
 
                 args = (all_kwargs,)
 
