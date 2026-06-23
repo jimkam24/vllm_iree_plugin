@@ -24,7 +24,7 @@ print(f"{'='*65}")
 
 os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
 os.environ["VLLM_PP_LAYER_PARTITION"] = "14,2"
-os.environ["IREE_GPU_ASSIGNMENT"] = "1,0"
+os.environ["IREE_GPU_ASSIGNMENT"] = "0,1"
 
 PROMPT = "The capital of France is"
 N_WARMUP = 3

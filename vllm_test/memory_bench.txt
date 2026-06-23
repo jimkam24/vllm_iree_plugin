@@ -1,0 +1,11 @@
+rm -f /tmp/memory_analysis.csv
+
+IREE_GPU_ASSIGNMENT=0,1 IREE_WORKER_RANKS=1 VLLM_PP_LAYER_PARTITION=14,2 \
+IREE_USE_FFN=0 IREE_USE_CPU_FFN=0 IREE_USE_CPU_FFN_IREE=0 \
+  python3 memory_analysis.py --tag no_ffn
+
+IREE_GPU_ASSIGNMENT=0,1 IREE_WORKER_RANKS=1 VLLM_PP_LAYER_PARTITION=14,2 \
+IREE_USE_FFN=1 IREE_USE_CPU_FFN_IREE=1 \
+  python3 memory_analysis.py --tag cpu_ffn
+
+python3 memory_analysis.py --compare

@@ -24,6 +24,7 @@ from vllm.logger import init_logger
 from vllm.v1.executor.ray_executor import RayDistributedExecutor
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.core.sched.output import SchedulerOutput
+from vllm_plugin.profiling.rank_latency_profiling import PROFILING_ENABLED, HybridExecutorWithProfiling
 
 logger = init_logger(__name__)
 
@@ -108,6 +109,8 @@ class HybridExecutor(RayDistributedExecutor):
                         env_dict["IREE_USE_CPU_FFN"] = "1"
                     if os.environ.get("IREE_USE_CPU_FFN_IREE", "0") == "1":
                         env_dict["IREE_USE_CPU_FFN_IREE"] = "1"
+                    env_dict["IREE_PROFILING"] = os.environ.get("IREE_PROFILING", "0")
+                    
                     
                 args = (all_env_vars,)
                 logger.info(
@@ -182,6 +185,9 @@ class HybridExecutor(RayDistributedExecutor):
           - record to metrics collector
         """
 
+        if PROFILING_ENABLED:
+            return HybridExecutorWithProfiling.execute_model(self, scheduler_output)
+
         # Phase 1: forward pass on all workers
         outputs = self.collective_rpc(
             "execute_model",
@@ -204,6 +210,65 @@ class HybridExecutor(RayDistributedExecutor):
             if output is not None and output.req_ids:
                 return output
         return None
+    
+    def determine_available_memory(self):
+        """
+        Per-GPU KV memory budgets.
+
+        Extends the native budget computation with optional per-rank utilization
+        override via IREE_GPU_UTIL (e.g. "0.4,0.1" → rank 0 at 0.4, rank 1 at 0.1).
+
+        If IREE_GPU_UTIL is unset, returns the native budgets unchanged — every
+        existing test keeps its current behavior.
+
+        The adjustment is exact, not a rescale:
+            resident       = total * global_util - native_budget
+            new_budget     = total * new_util    - resident
+                        = native_budget + total * (new_util - global_util)
+        so the residency and any freed-memory effects (e.g. FFN offload) are
+        preserved; only the utilization ceiling shifts per rank.
+        """
+        native = super().determine_available_memory()
+
+        spec = os.environ.get("IREE_GPU_UTIL", "").strip()
+        if not spec:
+            return native  # feature off → unchanged behavior
+
+        # Parse per-rank utilization list
+        try:
+            per_rank_util = [float(x.strip()) for x in spec.split(",")]
+        except ValueError:
+            logger.warning("HybridExecutor: bad IREE_GPU_UTIL=%r, ignoring", spec)
+            return native
+
+        if len(per_rank_util) != len(native):
+            logger.warning(
+                "HybridExecutor: IREE_GPU_UTIL has %d entries but %d ranks; ignoring",
+                len(per_rank_util), len(native))
+            return native
+
+        global_util = self.vllm_config.cache_config.gpu_memory_utilization
+
+        # Per-rank total GPU memory (one cheap RPC)
+        def _total_mem(worker):
+            import torch
+            _, total = torch.cuda.mem_get_info(0)
+            return total
+        totals = self.collective_rpc(_total_mem)
+
+        adjusted = []
+        for rank, native_budget in enumerate(native):
+            total = totals[rank]
+            new_util = per_rank_util[rank]
+            new_budget = native_budget + total * (new_util - global_util)
+            new_budget = max(0, int(new_budget))
+            adjusted.append(new_budget)
+            logger.info(
+                "HybridExecutor: rank %d util %.3f→%.3f, KV budget %.3f→%.3f GB",
+                rank, global_util, new_util,
+                native_budget / 1e9, new_budget / 1e9)
+
+        return adjusted
 
     # ── Profiling hooks (Step 4) ──────────────────────────────────────────────
     #

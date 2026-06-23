@@ -28,7 +28,7 @@ print(f"{'='*65}")
 
 os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
 os.environ["VLLM_PP_LAYER_PARTITION"] = "14,2"
-os.environ["IREE_GPU_ASSIGNMENT"] = "1,0"
+os.environ["IREE_GPU_ASSIGNMENT"] = "0,1"
 os.environ["IREE_CUDA_ARCH"] = "sm_70"
 
 PROMPT_LEN = 50
@@ -97,7 +97,7 @@ from transformers import AutoTokenizer
 
 engine_args = EngineArgs(
     model="meta-llama/Llama-3.2-1B",
-    dtype="float32",
+    dtype="bfloat16",
     max_model_len=512,
     max_num_seqs=128,
     max_num_batched_tokens=8192, 

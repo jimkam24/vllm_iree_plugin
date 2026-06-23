@@ -19,6 +19,8 @@ import numpy as np
 
 from vllm.v1.worker.gpu_worker import Worker as _NativeWorker
 from vllm.logger import init_logger
+import time
+from vllm_plugin.profiling.rank_latency_profiling import PROFILING_ENABLED
 
 logger = init_logger(__name__)
 
@@ -82,6 +84,7 @@ class IREEWorker(_NativeWorker):
                 "--iree-llvmcpu-target-cpu-features=host",
                 "--iree-llvmcpu-enable-vector-contract-custom-kernels",
                 "--iree-llvmcpu-reassociate-fp-reductions",
+                "--iree-opt-data-tiling",
             ]
             suffix = "cpu"
         else:
@@ -150,13 +153,48 @@ class IREEWorker(_NativeWorker):
             ctx.add_vm_module(vm_module)
             iree_fn = ctx.modules.module["main"]
 
+            mem_before = torch.cuda.memory_allocated(0)
+
             layer.mlp._original_forward = layer.mlp.forward
             layer.mlp.forward = make_iree_forward(iree_fn, iree_config)
-            logger.info("IREEWorker: IREE FFN (%s) patched on layer %d",
-                       suffix, layer_idx)
 
-        logger.info("IREEWorker: IREE FFN dispatch (%s) active for layers %d-%d.",
-                   suffix, layer_start, layer_end - 1)
+            # record the size of the GPU tensors we're about to release
+            gate_up_bytes = (layer.mlp.gate_up_proj.weight.data.numel()
+                             * layer.mlp.gate_up_proj.weight.data.element_size())
+            down_bytes = (layer.mlp.down_proj.weight.data.numel()
+                          * layer.mlp.down_proj.weight.data.element_size())
+
+            # release GPU-resident FFN weights — the IREE vmfb owns its own copy
+            layer.mlp.gate_up_proj.weight.data = torch.empty(0, device='cuda')
+            layer.mlp.down_proj.weight.data = torch.empty(0, device='cuda')
+
+            mem_after = torch.cuda.memory_allocated(0)
+
+            logger.info(
+                "IREEWorker: IREE FFN (%s) patched on layer %d | "
+                "weights freed: %.1f MB (gate_up %.1f + down %.1f) | "
+                "allocated %.1f MB -> %.1f MB (delta %.1f MB)",
+                suffix, layer_idx,
+                (gate_up_bytes + down_bytes) / 1024**2,
+                gate_up_bytes / 1024**2,
+                down_bytes / 1024**2,
+                mem_before / 1024**2,
+                mem_after / 1024**2,
+                (mem_before - mem_after) / 1024**2,
+            )
+
+        import gc
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        free_after, _ = torch.cuda.mem_get_info(0)
+        logger.info(
+            "IREEWorker: IREE FFN dispatch (%s) active for layers %d-%d | "
+            "allocated now %.1f MB | driver free now %.1f MB",
+            suffix, layer_start, layer_end - 1,
+            torch.cuda.memory_allocated(0) / 1024**2,
+            free_after / 1024**2,
+        )
 
     def _patch_mlp_cpu(self) -> None:
         """Move FFN weights to CPU and patch mlp.forward to run on CPU (BLAS)."""
@@ -183,16 +221,57 @@ class IREEWorker(_NativeWorker):
 
         for layer_idx in range(layer_start, layer_end):
             layer = model.model.layers[layer_idx]
+
+            mem_before = torch.cuda.memory_allocated(0)
+
             layer.mlp._original_forward = layer.mlp.forward
             layer.mlp.forward = make_cpu_forward(layer.mlp)
-            logger.info("IREEWorker: CPU FFN patched on layer %d", layer_idx)
+
+            # record the size of the GPU tensors we're about to release
+            gate_up_bytes = layer.mlp.gate_up_proj.weight.data.numel() * layer.mlp.gate_up_proj.weight.data.element_size()
+            down_bytes = layer.mlp.down_proj.weight.data.numel() * layer.mlp.down_proj.weight.data.element_size()
+
+            # release the GPU-resident FFN weights — the CPU module owns its own copies
+            layer.mlp.gate_up_proj.weight.data = torch.empty(0, device='cuda')
+            layer.mlp.down_proj.weight.data = torch.empty(0, device='cuda')
+
+            mem_after = torch.cuda.memory_allocated(0)
+
+            logger.info(
+                "IREEWorker: CPU FFN patched on layer %d | "
+                "weights to free: %.1f MB (gate_up %.1f + down %.1f) | "
+                "allocated %.1f MB -> %.1f MB (delta %.1f MB)",
+                layer_idx,
+                (gate_up_bytes + down_bytes) / 1024**2,
+                gate_up_bytes / 1024**2,
+                down_bytes / 1024**2,
+                mem_before / 1024**2,
+                mem_after / 1024**2,
+                (mem_before - mem_after) / 1024**2,
+            )
 
         gc.collect()
         torch.cuda.empty_cache()
+
+        # final snapshot after empty_cache returns pages to the driver
+        free_after, _ = torch.cuda.mem_get_info(0)
+        logger.info(
+            "IREEWorker: CPU FFN done, layers %d-%d | "
+            "allocated now %.1f MB | driver free now %.1f MB",
+            layer_start, layer_end - 1,
+            torch.cuda.memory_allocated(0) / 1024**2,
+            free_after / 1024**2,
+        )
         logger.info("IREEWorker: CPU FFN active for layers %d-%d.",
                    layer_start, layer_end - 1)
         
     def execute_model(self, scheduler_output):
+        
+        if PROFILING_ENABLED:
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            t0 = time.perf_counter()
+        
         output = super().execute_model(scheduler_output)
         if self.model_runner.input_batch is not None:
             for req in scheduler_output.scheduled_new_reqs:
@@ -200,7 +279,16 @@ class IREEWorker(_NativeWorker):
                 if req_idx is not None:
                     n_tokens = len(req.prompt_token_ids)
                     self.model_runner.input_batch.num_tokens_no_spec[req_idx] = n_tokens
+    
+        if PROFILING_ENABLED:
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            self._last_step_latency_ms = (time.perf_counter() - t0) * 1e3
+            
         return output
+    
+    def get_last_step_latency_ms(self) -> float:
+        return getattr(self, "_last_step_latency_ms", 0.0)
 
     def check_health(self) -> None:
         from vllm.distributed.parallel_state import get_pp_group

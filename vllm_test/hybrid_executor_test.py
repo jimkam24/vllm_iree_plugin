@@ -16,7 +16,7 @@ os.environ["MASTER_PORT"] = "29500"
 os.environ["IREE_CUDA_ARCH"] = "sm_86"
 os.environ["IREE_WORKER_RANKS"] = "1"  # select which ranks run iree
 os.environ["VLLM_PP_LAYER_PARTITION"] = "14,2" # layer split to ranks
-os.environ["IREE_GPU_ASSIGNMENT"]="1,0" # gpu assignment to ranks
+os.environ["IREE_GPU_ASSIGNMENT"]="0,1" # gpu assignment to ranks
 # os.environ["IREE_FORCE_RECOMPILE"] = "1"
 os.environ["IREE_USE_VLLM_MODEL"] = "1"
 os.environ["IREE_USE_FFN"] = "1" # FFN with IREE (GPU default or with CPU paired with use cpu ffn iree)
@@ -40,7 +40,7 @@ print("=" * 60)
 print("\n[1] Building VllmConfig...")
 engine_args = EngineArgs(
     model="meta-llama/Llama-3.2-1B",
-    dtype="float32",
+    dtype="bfloat16",
     max_model_len=512,
     max_num_seqs=4,
     enforce_eager=True,
