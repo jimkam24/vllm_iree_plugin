@@ -48,6 +48,7 @@ class HybridExecutor(RayDistributedExecutor):
     """
 
     supports_pp: bool = True
+    uses_ray: bool = True
 
     def __init__(self, vllm_config, **kwargs):
         # Parse BEFORE any env manipulation — store as instance var
